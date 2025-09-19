@@ -8,12 +8,12 @@ import {
 } from "@typeagent/agent-sdk/helpers/action";
 import { CommandHandlerContext } from "../context/commandHandlerContext.js";
 import {
-    LookupAndAnswerAction,
+    LookupAction,
     TermFilter,
 } from "../context/dispatcher/schema/lookupActionSchema.js";
 import { ActionContext, ActionResult, Entity } from "@typeagent/agent-sdk";
 import { conversation } from "knowledge-processor";
-import { getLookupSettings, handleLookup } from "./internet.js";
+//import { getLookupSettings, handleLookup } from "./internet.js";
 import registerDebug from "debug";
 import { getImageElement, getMimeType } from "common-utils";
 import { lookupAndAnswerFromMemory } from "../context/memory.js";
@@ -89,33 +89,33 @@ async function getAnswerFromConversationManager(
 }
 
 export async function lookupAndAnswer(
-    lookupAction: LookupAndAnswerAction,
+    lookupAction: LookupAction,
     context: ActionContext<CommandHandlerContext>,
 ): Promise<ActionResult> {
-    const source = lookupAction.parameters.lookup.source;
+    const source = lookupAction.actionName;
     switch (source) {
-        case "internet": {
-            const { question, lookup, originalRequest } =
-                lookupAction.parameters;
+        // case "internet": {
+        //     const { question, lookup, originalRequest } =
+        //         lookupAction.parameters;
 
-            const result = handleLookup(
-                question,
-                lookup.internetLookups,
-                lookup.site,
-                context,
-                await getLookupSettings(true),
-                originalRequest,
-            );
+        //     const result = handleLookup(
+        //         question,
+        //         lookup.internetLookups,
+        //         lookup.site,
+        //         context,
+        //         await getLookupSettings(true),
+        //         originalRequest,
+        //     );
 
-            return result;
-        }
-        case "conversation": {
+        //     return result;
+        // }
+        case "lookupAndAnswerConversation": {
             const systemContext = context.sessionContext.agentContext;
             if (systemContext.session.getConfig().execution.memory.legacy) {
                 return getAnswerFromConversationManager(
                     context,
                     lookupAction.parameters.question,
-                    lookupAction.parameters.lookup.conversationLookupFilters,
+                    lookupAction.parameters.conversationLookupFilters,
                 );
             }
             const historyText = await lookupAndAnswerFromMemory(

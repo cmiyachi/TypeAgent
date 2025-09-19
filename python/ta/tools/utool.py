@@ -28,6 +28,9 @@ import typechat
 from typeagent.aitools import embeddings
 from typeagent.aitools import utils
 
+from typeagent.knowpro import answers, answer_response_schema
+from typeagent.knowpro import convknowledge
+from typeagent.knowpro.convsettings import ConversationSettings
 from typeagent.knowpro.interfaces import (
     IConversation,
     IMessage,
@@ -35,11 +38,9 @@ from typeagent.knowpro.interfaces import (
     ScoredMessageOrdinal,
     ScoredSemanticRefOrdinal,
     SemanticRef,
+    Tag,
     Topic,
 )
-from typeagent.knowpro import answers, answer_response_schema
-from typeagent.knowpro import convknowledge
-from typeagent.knowpro import importing
 from typeagent.knowpro import kplib
 from typeagent.knowpro import query
 from typeagent.knowpro import search, search_query_schema, searchlang
@@ -47,32 +48,10 @@ from typeagent.knowpro import serialization
 
 from typeagent.podcasts import podcast
 
-
-### Logfire setup ###
-
-
-def setup_logfire():
-    import logfire
-
-    def scrubbing_callback(m: logfire.ScrubMatch):
-        # if m.path == ('attributes', 'http.request.header.authorization'):
-        #     return m.value
-
-        # if m.path == ('attributes', 'http.request.header.api-key'):
-        #     return m.value
-
-        if (
-            m.path == ("attributes", "http.request.body.text", "messages", 0, "content")
-            and m.pattern_match.group(0) == "secret"
-        ):
-            return m.value
-
-        # if m.path == ('attributes', 'http.response.header.azureml-model-session'):
-        #     return m.value
-
-    logfire.configure(scrubbing=logfire.ScrubbingOptions(callback=scrubbing_callback))
-    logfire.instrument_pydantic_ai()
-    logfire.instrument_httpx(capture_all=True)
+from typeagent.storage.memory.propindex import build_property_index
+from typeagent.storage.memory.reltermsindex import build_related_terms_index
+from typeagent.storage.sqlite.provider import SqliteStorageProvider
+from typeagent.storage.utils import create_storage_provider
 
 
 ### Classes ###
@@ -143,17 +122,33 @@ async def main():
     parser = make_arg_parser("TypeAgent Query Tool")
     args = parser.parse_args()
     fill_in_debug_defaults(parser, args)
+
     if args.logfire:
-        setup_logfire()
-    settings = importing.ConversationSettings()
-    query_context = await load_podcast_index(args.podcast, settings, args.sqlite_db)
-    ar_list, ar_index = load_index_file(args.qafile, "question", QuestionAnswerData)
-    sr_list, sr_index = load_index_file(args.srfile, "searchText", SearchResultData)
+        utils.setup_logfire()
+
+    settings = ConversationSettings()  # Has no storage provider yet
+    settings.storage_provider = await create_storage_provider(
+        settings.message_text_index_settings,
+        settings.related_term_index_settings,
+        args.sqlite_db,
+        podcast.PodcastMessage,
+    )
+    query_context = await load_podcast_index(
+        args.podcast, settings, args.sqlite_db, args.verbose
+    )
+
+    ar_list, ar_index = load_index_file(
+        args.qafile, "question", QuestionAnswerData, args.verbose
+    )
+    sr_list, sr_index = load_index_file(
+        args.srfile, "searchText", SearchResultData, args.verbose
+    )
 
     model = convknowledge.create_typechat_model()
     query_translator = utils.create_translator(model, search_query_schema.SearchQuery)
     if args.alt_schema:
-        print(f"Substituting alt schema from {args.alt_schema}")
+        if args.verbose:
+            print(f"Substituting alt schema from {args.alt_schema}")
         with open(args.alt_schema) as f:
             query_translator.schema_str = f.read()
     if args.show_schema:
@@ -188,26 +183,101 @@ async def main():
         ),
     )
 
-    utils.pretty_print(context, Fore.BLUE, Fore.RESET)
+    if args.verbose:
+        utils.pretty_print(context, Fore.BLUE, Fore.RESET)
 
-    if args.batch:
-        print(
-            Fore.YELLOW
-            + f"Running in batch mode [{args.offset}:{args.offset + args.limit if args.limit else ''}]."
-            + Fore.RESET
-        )
-        await batch_loop(context, args.offset, args.limit)
+    if args.question is not None:
+        if args.verbose:
+            print(
+                Fore.YELLOW
+                + f"Processing single question: {args.question}"
+                + Fore.RESET
+            )
+        await process_query(context, args.question)
+    elif args.batch:
+        if args.verbose:
+            print(
+                Fore.YELLOW
+                + f"Running in batch mode [{args.offset}:{args.offset + args.limit if args.limit else ''}]."
+                + Fore.RESET
+            )
+        await batch_loop(context, args.offset, args.limit, args.skip_counters)
     else:
-        print(Fore.YELLOW + "Running in interactive mode." + Fore.RESET)
+        if args.verbose:
+            print(Fore.YELLOW + "Running in interactive mode." + Fore.RESET)
         await interactive_loop(context)
 
 
-async def batch_loop(context: ProcessingContext, offset: int, limit: int) -> None:
+async def print_conversation_stats(c: IConversation, verbose: bool = True) -> None:
+    if not verbose:
+        return
+    print(f"{await c.messages.size()} messages loaded.")
+    print(f"{await c.semantic_refs.size()} semantic refs loaded.")
+    print(f"{await c.semantic_ref_index.size()} sem_ref index entries.")
+    s = c.secondary_indexes
+    if s is None:
+        if verbose:
+            print("NO SECONDARY INDEXES")
+        return
+
+    if s.property_to_semantic_ref_index is None:
+        if verbose:
+            print("NO PROPERTY TO SEMANTIC REF INDEX")
+    else:
+        n = await s.property_to_semantic_ref_index.size()
+        if verbose:
+            print(f"{n} property to semantic ref index entries.")
+
+    if s.timestamp_index is None:
+        if verbose:
+            print("NO TIMESTAMP INDEX")
+    else:
+        if verbose:
+            print(f"{await s.timestamp_index.size()} timestamp index entries.")
+
+    if s.term_to_related_terms_index is None:
+        if verbose:
+            print("NO TERM TO RELATED TERMS INDEX")
+    else:
+        aliases = s.term_to_related_terms_index.aliases
+        if verbose:
+            print(f"{await aliases.size()} alias entries.")
+        f = s.term_to_related_terms_index.fuzzy_index
+        if f is None:
+            if verbose:
+                print("NO FUZZY RELATED TERMS INDEX")
+        else:
+            if verbose:
+                print(f"{await f.size()} term entries.")
+
+    if s.threads is None:
+        if verbose:
+            print("NO THREADS INDEX")
+    else:
+        if verbose:
+            print(f"{len(s.threads.threads)} threads index entries.")
+
+    if s.message_index is None:
+        if verbose:
+            print("NO MESSAGE INDEX")
+    else:
+        if verbose:
+            print(f"{await s.message_index.size()} message index entries.")
+
+
+async def batch_loop(
+    context: ProcessingContext, offset: int, limit: int, skip_counters: str
+) -> None:
+    skips = []
+    if skip_counters:
+        skips = [int(x) for x in skip_counters.split(",") if x.strip().isdigit()]
     if limit == 0:
         limit = len(context.ar_list) - offset
     sublist = context.ar_list[offset : offset + limit]
     all_scores = []
     for counter, qadata in enumerate(sublist, offset + 1):
+        if counter in skips:
+            continue
         question = qadata["question"]
         print("-" * 20, counter, question, "-" * 20)
         score = await process_query(context, question)
@@ -272,6 +342,8 @@ async def interactive_loop(context: ProcessingContext) -> None:
 
 
 async def process_query(context: ProcessingContext, query_text: str) -> float | None:
+    if not query_text.strip():
+        return  # Ignore blank query (like interactive mode)
     record = context.sr_index.get(query_text)
     debug_context = searchlang.LanguageSearchDebugContext()
     if context.debug1 == "skip" or context.debug2 == "skip":
@@ -446,10 +518,29 @@ def make_arg_parser(description: str) -> argparse.ArgumentParser:
         help=f"Path to the Search_results.json file ({explain_sr})",
     )
     parser.add_argument(
+        "--skip-counters",
+        type=str,
+        default="",
+        help="List of comma-separated questions to skip",
+    )
+    parser.add_argument(
         "--sqlite-db",
         type=str,
         default=None,
         help="Path to the SQLite database file (default: no SQLite)",
+    )
+    parser.add_argument(
+        "--question",
+        "--query",
+        type=str,
+        default=None,
+        help="Process a single question and exit (equivalent to echo 'question' | utool.py)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show verbose startup information and timing logs",
     )
 
     batch = parser.add_argument_group("Batch mode options")
@@ -540,6 +631,9 @@ def fill_in_debug_defaults(
 ) -> None:
     # In batch mode, defaults are diff, diff, diff, diff.
     # In interactive mode they are none, none, none, nice.
+    if args.question is not None and args.batch:
+        parser.exit(2, "Error: --question cannot be combined with --batch\n")
+
     if not args.batch:
         if args.start or args.offset or args.limit:
             parser.exit(2, "Error: --start, --offset and --limit require --batch\n")
@@ -565,21 +659,30 @@ def fill_in_debug_defaults(
 
 async def load_podcast_index(
     podcast_file_prefix: str,
-    settings: importing.ConversationSettings,
+    settings: ConversationSettings,
     dbname: str | None,
+    verbose: bool = True,
 ) -> query.QueryEvalContext:
-    with utils.timelog(f"load podcast from {podcast_file_prefix!r}"):
-        conversation = await podcast.Podcast.read_from_file(
-            podcast_file_prefix, settings, dbname
-        )
-    assert (
-        conversation is not None
-    ), f"Failed to load podcast from {podcast_file_prefix!r}"
+    provider = await settings.get_storage_provider()
+    msgs = await provider.get_message_collection()
+    if await msgs.size() > 0:  # Sqlite provider with existing non-empty database
+        with utils.timelog(f"Reusing podcast db {dbname}"):
+            conversation = await podcast.Podcast.create(settings)
+    else:
+        with utils.timelog(f"Loading podcast from {podcast_file_prefix!r}"):
+            conversation = await podcast.Podcast.read_from_file(
+                podcast_file_prefix, settings, dbname
+            )
+            if isinstance(provider, SqliteStorageProvider):
+                provider.db.commit()
+
+    await print_conversation_stats(conversation, verbose)
+
     return query.QueryEvalContext(conversation)
 
 
 def load_index_file[T: Mapping[str, typing.Any]](
-    file: str, selector: str, cls: type[T]
+    file: str, selector: str, cls: type[T], verbose: bool = True
 ) -> tuple[list[T], dict[str, T]]:
     # If this crashes, the file is malformed -- go figure it out.
     try:
@@ -589,7 +692,7 @@ def load_index_file[T: Mapping[str, typing.Any]](
         print(Fore.RED + str(err) + Fore.RESET)
         lst = []
     index = {item[selector]: item for item in lst}
-    if len(index) != len(lst):
+    if len(index) != len(lst) and verbose:
         print(f"{len(lst) - len(index)} duplicate items found in {file!r}. ")
     return lst, index
 
@@ -646,52 +749,48 @@ def summarize_knowledge(sem_ref: SemanticRef) -> str:
     knowledge = sem_ref.knowledge
     if knowledge is None:
         return f"{sem_ref.semantic_ref_ordinal}: <No knowledge>"
-    match sem_ref.knowledge_type:
-        case "entity":
-            entity = knowledge
-            assert isinstance(entity, kplib.ConcreteEntity)
-            res = [f"{entity.name} [{', '.join(entity.type)}]"]
-            if entity.facets:
-                for facet in entity.facets:
-                    value = facet.value
-                    if isinstance(value, kplib.Quantity):
-                        value = f"{value.amount} {value.units}"
-                    elif isinstance(value, float) and value.is_integer():
-                        value = int(value)
-                    res.append(f"<{facet.name}:{value}>")
-            return f"{sem_ref.semantic_ref_ordinal}: {' '.join(res)}"
-        case "action":
-            action = knowledge
-            assert isinstance(action, kplib.Action)
-            res = []
-            res.append("/".join(repr(verb) for verb in action.verbs))
-            if action.verb_tense:
-                res.append(f"[{action.verb_tense}]")
-            if action.subject_entity_name != "none":
-                res.append(f"subj={action.subject_entity_name!r}")
-            if action.object_entity_name != "none":
-                res.append(f"obj={action.object_entity_name!r}")
-            if action.indirect_object_entity_name != "none":
-                res.append(f"ind_obj={action.indirect_object_entity_name}")
-            if action.params:
-                for param in action.params:
-                    if isinstance(param, kplib.ActionParam):
-                        res.append(f"<{param.name}:{param.value}>")
-                    else:
-                        res.append(f"<{param}>")
-            if action.subject_entity_facet is not None:
-                res.append(f"subj_facet={action.subject_entity_facet}")
-            return f"{sem_ref.semantic_ref_ordinal}: {' '.join(res)}"
-        case "topic":
-            topic = knowledge
-            assert isinstance(topic, Topic)
-            return f"{sem_ref.semantic_ref_ordinal}: {topic.text!r}]"
-        case "tag":
-            tag = knowledge
-            assert isinstance(tag, str)
-            return f"{sem_ref.semantic_ref_ordinal}: #{tag!r}"
-        case _:
-            return f"{sem_ref.semantic_ref_ordinal}: {sem_ref.knowledge!r}"
+
+    if isinstance(knowledge, kplib.ConcreteEntity):
+        entity = knowledge
+        res = [f"{entity.name} [{', '.join(entity.type)}]"]
+        if entity.facets:
+            for facet in entity.facets:
+                value = facet.value
+                if isinstance(value, kplib.Quantity):
+                    value = f"{value.amount} {value.units}"
+                elif isinstance(value, float) and value.is_integer():
+                    value = int(value)
+                res.append(f"<{facet.name}:{value}>")
+        return f"{sem_ref.semantic_ref_ordinal}: {' '.join(res)}"
+    elif isinstance(knowledge, kplib.Action):
+        action = knowledge
+        res = []
+        res.append("/".join(repr(verb) for verb in action.verbs))
+        if action.verb_tense:
+            res.append(f"[{action.verb_tense}]")
+        if action.subject_entity_name != "none":
+            res.append(f"subj={action.subject_entity_name!r}")
+        if action.object_entity_name != "none":
+            res.append(f"obj={action.object_entity_name!r}")
+        if action.indirect_object_entity_name != "none":
+            res.append(f"ind_obj={action.indirect_object_entity_name}")
+        if action.params:
+            for param in action.params:
+                if isinstance(param, kplib.ActionParam):
+                    res.append(f"<{param.name}:{param.value}>")
+                else:
+                    res.append(f"<{param}>")
+        if action.subject_entity_facet is not None:
+            res.append(f"subj_facet={action.subject_entity_facet}")
+        return f"{sem_ref.semantic_ref_ordinal}: {' '.join(res)}"
+    elif isinstance(knowledge, Topic):
+        topic = knowledge
+        return f"{sem_ref.semantic_ref_ordinal}: {topic.text!r}"
+    elif isinstance(knowledge, Tag):
+        tag = knowledge
+        return f"{sem_ref.semantic_ref_ordinal}: #{tag.text!r}"
+    else:
+        return f"{sem_ref.semantic_ref_ordinal}: {sem_ref.knowledge!r}"
 
 
 def compare_results(
@@ -795,25 +894,29 @@ async def compare_answers(
             f"Expected success: {Fore.RED}{expected_success}{Fore.RESET}; "
             f"actual: {Fore.GREEN}{actual_success}{Fore.RESET}"
         )
+        score = 0.000 if expected_success else 0.001  # 0.001 == Answer not expected
 
     elif not actual_success:
         print(Fore.GREEN + f"Both failed" + Fore.RESET)
-        return 1.001
+        score = 1.001
 
     elif expected_text == actual_text:
         print(Fore.GREEN + f"Both equal" + Fore.RESET)
-        return 1.000
+        score = 1.000
+
+    else:
+        score = await equality_score(context, expected_text, actual_text)
 
     if len(expected_text.splitlines()) <= 100 and len(actual_text.splitlines()) <= 100:
         n = 100
     else:
         n = 2
-    print_diff(expected_text, actual_text, n=n)
-
-    if expected_success != actual_success:
-        return 0.000 if expected_success else 0.001  # 0.001 == Answer not expected
+    if score == 1.0:
+        print(actual_text)
     else:
-        return await equality_score(context, expected_text, actual_text)
+        print_diff(expected_text, actual_text, n=n)
+
+    return score
 
 
 def print_diff(a: str, b: str, n: int) -> None:

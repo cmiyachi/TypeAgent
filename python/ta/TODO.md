@@ -1,10 +1,80 @@
 # TODO for the Python knowpro port
 
+# TODOs for new repo setup
+
+- Merge newer changes from TypeAgent repo
+- Vendor TypeChat (Python version)
+- Update load_dotenv() to look for .env in current directory and going up (*plus* ts/.env)
+
+# TODOs for fully implementing persistence through SQLite
+
+## Now
+
+- Switch to (agents.md)[https://agents.md]
+
+- Vendor TypeChat
+
+- Start practicing PyPI releases
+
+- Scrutinize sqlite/reltermsindex.py
+- Unify tests for storage APIs
+- Review the new storage code more carefully, adding notes here
+- Conversation id in conversation metadata table feels wrong
+- Conversation metadata isn't written -- needs a separate call
+- Improve test coverage for search, searchlang, query, sqlite
+- Reduce code size
+- Make coding style more uniform (e.g. docstrings)
+- Document the highest-level API
+
+## Also
+
+- The aliases part of the related terms index is hard to understand because the
+  relationship between term and alias feels reversed:
+  We have dozens of aliases for "say", and these all show up as entries
+  like (term="talk", alias="say"), (term="discuss", alias="say"), etc.
+  My feeling (from the unix shell alias command) is that the term is "say"
+  and the alias is "talk", "discuss", etc.
+  (Not sure if the same is true for the fuzzy index, but I am confused there too.)
+- Make (de)serialize methods async in interfaces.py if they might execute SQL statements
+
+## Knowledge extraction pipeline
+
+- Write a function that does the following:
+  - Add a given list of messages to the end of the message collection
+  - Extracts knowledge for all
+  - Call the next function
+
+- Write a function that adds a list of messages *and* a list of corresponding
+  semantic refs, and then updates everything. This is somewhat complicated
+  because we won't know the message ordinals/ids until they have been
+  inserted, and ditto for the semantic refs.
+  (Why do semantic refs contain their own ord/id anyway?)
+
+## Maybe
+
+- Flatten secondary indexes into Conversation (they are no longer optional)
+- Split related terms index in two (aliases and fuzzy_index)
+- Make the collection/index accessors in StorageProvider synchronous
+  (the async work is all done in create())
+- Replace the storage accessors with readonly @property functions
+- Refactor memory and sqlite indexes to share more code
+  (e.g. population and query logic)
+- Store embeddings in message_index
+
+## Lower priority
+
+- Rework pyproject to separate build-time from runtime deps
+  - Make some runtime deps optional (e.g. logfire, mcp)
+  - Comment out pydantic-ai until we resume that work
+
+- Try to avoid so many inline imports.
+  Break cycles by moving things to their own file if necessary
+
 # From Meeting 8/12/2025 morning
 
-- Get rid of `__getitem__` in favor of get_item(), get_slice(), get_multiple() [DONE]
-  - Also rename `__len__` to size() [DONE]
-- Switch db API to async (even for in-memory); fix all related bugs [DONE]
+- Get rid of `__getitem__` in favor of get_item(), get_slice(), get_multiple() [**DONE**]
+  - Also rename `__len__` to size() [**DONE**]
+- Switch db API to async (even for in-memory); fix all related bugs [**DONE**]
 - "Ordinals" ("ids") are sequential (ordered) but not contiguous
 - So we can use auto-increment
 - Fix all bugs related to that
@@ -20,11 +90,11 @@
 
 # From Meeting 8/12/2025 afternoon
 
-- Toss out character ordinals from TextLocation etc. [DONE]
-  - Message ordinal must exist
+- Toss out character ordinals from TextLocation etc. [**DONE**]
+  - Message ordinal must exist [**DONE**]
   - Chunk ordinal of end in range is 1 past last chunk in range
-    (== standard Python slice conventions)
-  - TextRange is a half-open interval; end points past last chunk
+    (== standard Python slice conventions) [**DONE**]
+  - TextRange is a half-open interval; end points past last chunk [**DONE**]
 - Indexing (knowledge extraction) operates chunk by chunk
 - TimeRange always points to a TextRange
 - Always import VTT, helper to convert podcast to VTT format
@@ -49,6 +119,8 @@
 - Everything else is unofficial and undocumented
 
 ### Sqlite database schema details
+
+**THIS HAS BEEN SUPERSEDED BY THE FILES IN THE `spec/` FOLDER**
 
 Note: `*` means a column with an index
 

@@ -1,16 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+export type DisabledBrowserActions = Search | SearchWebMemories;
 export type BrowserActions =
     | OpenWebPage
     | CloseWebPage
+    | CloseAllWebPages
+    | ChangeTabs
     | GoBack
     | GoForward
     | ScrollDown
     | ScrollUp
     | FollowLinkByText
     | FollowLinkByPosition
-    | Search
     | ReadPageContent
     | StopReadPageContent
     | ZoomIn
@@ -19,19 +21,24 @@ export type BrowserActions =
     | CaptureScreenshot
     | ReloadPage
     | GetWebsiteStats
-    | SearchWebMemories
-    | OpenSearchResult;
+    | OpenSearchResult
+    | ChangeSearchProvider
+    | SearchImageAction;
 
-export type WebPage = string;
 export type WebSearchResult = string;
-export type BrowserEntities = WebPage | WebSearchResult;
+export type BrowserEntities = WebPageMoniker | WebSearchResult;
+
+// A web site name OR search terms for a specific web page.
+// Do NOT convert search terms into a URL.
+// If the user supplies a protocol with any URL (https://, ftp://, typeagent-browser://, etc.), use it as is.
+// Fully qualified domain names provided by the user are assumed to have HTTP as the protocol.
+export type WebPageMoniker = string;
 
 // show/open/display web page in the current view.
 export type OpenWebPage = {
     actionName: "openWebPage";
     parameters: {
-        // Name or description of the site to search for and open
-        // Do NOT put URL here unless the user request specified the URL.
+        // Name/Description/search terms of the site to open
         site:
             | "paleobiodb"
             | "crossword"
@@ -43,7 +50,20 @@ export type OpenWebPage = {
             | "annotationsLibrary"
             | "knowledgeLibrary"
             | "macrosLibrary"
-            | WebPage;
+            | WebPageMoniker;
+        // Enum indicating if the page to open in the new tab or the current tab.
+        // Default value is "current"
+        tab: "new" | "current" | "existing";
+    };
+};
+
+// Make another tab the activbe tab
+export type ChangeTabs = {
+    actionName: "changeTab";
+    parameters: {
+        tabDescription: string;
+        // The numerical index referred to by the descripton if applicable.  (i.e. first = 1, second = 2, etc.)
+        tabIndex?: number;
     };
 };
 
@@ -52,11 +72,9 @@ export type CloseWebPage = {
     actionName: "closeWebPage";
 };
 
-export type Search = {
-    actionName: "search";
-    parameters: {
-        query?: string;
-    };
+// Close all web page views
+export type CloseAllWebPages = {
+    actionName: "closeAllWebPages";
 };
 
 export type GoBack = {
@@ -139,7 +157,18 @@ export type GetWebsiteStats = {
     };
 };
 
+// Display a search results page for the specified query
+// Do NOT default to search if the user request doesn't explicitly ask for a search
+export type Search = {
+    actionName: "search";
+    parameters: {
+        query?: string;
+        newTab: boolean; // default is false;
+    };
+};
+
 // Search web memories (unified search replacing queryWebKnowledge and searchWebsites)
+// Do NOT default to search if the user request doesn't explicitly ask for a search
 export type SearchWebMemories = {
     actionName: "searchWebMemories";
     parameters: {
@@ -181,5 +210,28 @@ export type OpenSearchResult = {
         url?: string;
         // Open in new tab (default: false)
         openInNewTab?: boolean;
+    };
+};
+
+// change the default search provider
+export type ChangeSearchProvider = {
+    actionName: "changeSearchProvider";
+    parameters: {
+        // The name of the search provider to switch to
+        name: string;
+    };
+};
+
+// Searches (finds) for images on the internet to show the user
+// if the user asks doesn't specify a quantity, randomly select anywhere between 3 and 10 images
+export type SearchImageAction = {
+    actionName: "searchImageAction";
+    parameters: {
+        // the original request of the user
+        originalRequest: string;
+        // the search term for the image(s) to find
+        searchTerm: string;
+        // the number of images to show the user
+        numImages: number;
     };
 };

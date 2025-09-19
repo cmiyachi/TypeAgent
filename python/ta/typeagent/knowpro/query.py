@@ -2,11 +2,10 @@
 # Licensed under the MIT License.
 
 from abc import ABC, abstractmethod
-from ast import Not
-from collections.abc import Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from re import search
-from typing import Callable, Literal, Protocol, cast
+from typing import Literal, Protocol, cast
 
 from ..aitools.embeddings import NormalizedEmbedding
 
@@ -37,16 +36,19 @@ from .interfaces import (
     ScoredMessageOrdinal,
     ScoredSemanticRefOrdinal,
     SearchTerm,
+    SearchTermGroup,
     SemanticRef,
     SemanticRefOrdinal,
     SemanticRefSearchResult,
     Term,
     TextLocation,
     TextRange,
+    Thread,
 )
 from .kplib import ConcreteEntity
-from .messageindex import IMessageTextEmbeddingIndex
-from .propindex import PropertyNames, lookup_property_in_property_index
+from ..storage.memory.messageindex import IMessageTextEmbeddingIndex
+from ..storage.memory.propindex import PropertyNames, lookup_property_in_property_index
+from .searchlib import create_property_search_term, create_tag_search_term_group
 
 
 # TODO: Move to compilelib.py
@@ -176,7 +178,7 @@ async def lookup_term_filtered(
     filter: Callable[[SemanticRef, ScoredSemanticRefOrdinal], bool],
 ) -> list[ScoredSemanticRefOrdinal] | None:
     """Look up a term in the semantic reference index and filter the results."""
-    scored_refs = semantic_ref_index.lookup_term(term.text)
+    scored_refs = await semantic_ref_index.lookup_term(term.text)
     if scored_refs:
         filtered = []
         for sr in scored_refs:
@@ -192,7 +194,7 @@ async def lookup_term(
     term: Term,
     semantic_refs: ISemanticRefCollection,
     ranges_in_scope: TextRangesInScope | None = None,
-    ktype: KnowledgeType | None = None,
+    knowledge_type: KnowledgeType | None = None,
 ) -> list[ScoredSemanticRefOrdinal] | None:
     """Look up a term in the semantic reference index, optionally filtering by ranges in scope."""
     if ranges_in_scope is not None:
@@ -201,10 +203,12 @@ async def lookup_term(
             semantic_ref_index,
             term,
             semantic_refs,
-            lambda sr, _: (not ktype or sr.knowledge_type == ktype)
+            lambda sr, _: (
+                not knowledge_type or sr.knowledge.knowledge_type == knowledge_type
+            )
             and ranges_in_scope.is_range_in_scope(sr.range),
         )
-    return semantic_ref_index.lookup_term(term.text)
+    return await semantic_ref_index.lookup_term(term.text)
 
 
 # TODO: lookup_property
@@ -280,12 +284,12 @@ class QueryEvalContext[TMessage: IMessage, TIndex: ITermToSemanticRefIndex]:
 
 
 async def lookup_knowledge_type(
-    semantic_refs: ISemanticRefCollection, ktype: KnowledgeType
+    semantic_refs: ISemanticRefCollection, knowledge_type: KnowledgeType
 ) -> list[ScoredSemanticRefOrdinal]:
     return [
         ScoredSemanticRefOrdinal(sr.semantic_ref_ordinal, 1.0)
         async for sr in semantic_refs
-        if sr.knowledge_type == ktype
+        if sr.knowledge.knowledge_type == knowledge_type
     ]
 
 
@@ -796,7 +800,7 @@ class TextRangesInDateRangeSelector(IQueryTextRangeSelector):
         text_ranges_in_scope = TextRangeCollection()
 
         if context.timestamp_index is not None:
-            text_ranges = context.timestamp_index.lookup_range(
+            text_ranges = await context.timestamp_index.lookup_range(
                 self.date_range_in_scope,
             )
             for time_range in text_ranges:
@@ -903,7 +907,7 @@ class RankMessagesBySimilarityExpr(QueryOpExpr[MessageAccumulator]):
             else context.conversation.secondary_indexes.message_index
         )
         if isinstance(message_index, IMessageTextEmbeddingIndex):
-            message_ordinals = self._get_message_ordinals_in_index(
+            message_ordinals = await self._get_message_ordinals_in_index(
                 message_index, matches
             )
             if len(message_ordinals) == len(matches):
@@ -923,11 +927,11 @@ class RankMessagesBySimilarityExpr(QueryOpExpr[MessageAccumulator]):
             matches.select_top_n_scoring(self.max_messages)
         return matches
 
-    def _get_message_ordinals_in_index(
+    async def _get_message_ordinals_in_index(
         self, message_index, matches: MessageAccumulator
     ):
         message_ordinals: list[MessageOrdinal] = []
-        index_size = len(message_index)
+        index_size = await message_index.size()
         for message_ordinal in matches.get_matched_values():
             if message_ordinal >= index_size:
                 break
@@ -1079,3 +1083,46 @@ async def message_matches_from_knowledge_matches(
             message_matches = MessageAccumulator(relevant_messages)
     message_matches.smooth_scores()
     return message_matches
+
+
+# TODO: Implement proper SelectMessagesInCharBudget functionality
+@dataclass
+class SelectMessagesInCharBudget(QueryOpExpr[MessageAccumulator]):
+    """Selects messages within a character budget."""
+
+    src_expr: IQueryOpExpr[MessageAccumulator]
+    max_chars: int
+
+    async def eval(self, context: QueryEvalContext) -> MessageAccumulator:
+        matches = await self.src_expr.eval(context)
+        await matches.select_messages_in_budget(context.messages, self.max_chars)
+        return matches
+
+
+# TODO: Implement proper KnowledgeTypePredicate functionality
+@dataclass
+class KnowledgeTypePredicate(IQuerySemanticRefPredicate):
+    """Predicate to filter by knowledge type."""
+
+    knowledge_type: KnowledgeType
+
+    async def eval(self, context: QueryEvalContext, semantic_ref: SemanticRef) -> bool:
+        return semantic_ref.knowledge.knowledge_type == self.knowledge_type
+
+
+# TODO: Implement proper ThreadSelector functionality
+@dataclass
+class ThreadSelector(IQueryTextRangeSelector):
+    """Selector for thread-based text ranges."""
+
+    threads: list[Thread]
+
+    async def eval(
+        self,
+        context: QueryEvalContext,
+        semantic_refs: SemanticRefAccumulator | None = None,
+    ) -> TextRangeCollection | None:
+        text_ranges = TextRangeCollection()
+        for thread in self.threads:
+            text_ranges.add_ranges(list(thread.ranges))
+        return text_ranges

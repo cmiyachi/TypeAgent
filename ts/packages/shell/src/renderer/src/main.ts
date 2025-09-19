@@ -9,7 +9,8 @@ import {
     SpeechToken,
     ShellUserSettings,
     Client,
-} from "../../preload/electronTypes.js";
+    SearchMenuItem,
+} from "../../preload/electronTypes";
 import { ChatView } from "./chatView";
 import { TabView } from "./tabView";
 import { getSpeechToken, setSpeechToken } from "./speechToken";
@@ -23,6 +24,11 @@ import * as jose from "jose";
 import { AppAgentEvent } from "@typeagent/agent-sdk";
 import { ClientIO, Dispatcher } from "agent-dispatcher";
 import { swapContent } from "./setContent";
+import { remoteSearchMenuUIOnCompletion } from "./searchMenuUI/remoteSearchMenuUI";
+
+export function isElectron(): boolean {
+    return globalThis.api !== undefined;
+}
 
 export function getClientAPI(): ClientAPI {
     if (globalThis.api !== undefined) {
@@ -289,9 +295,9 @@ function registerClient(
 
     const client: Client = {
         clientIO,
-        updateRegisterAgents(updatedAgents: Map<string, string>): void {
+        updateRegisterAgents(updatedAgents: [string, string][]): void {
             agents.clear();
-            for (const [key, value] of updatedAgents.entries()) {
+            for (const [key, value] of updatedAgents) {
                 agents.set(key, value);
             }
         },
@@ -317,6 +323,12 @@ function registerClient(
             }
 
             chatView.chatInput.recognizeOnce(token, useLocalWhisper);
+        },
+        focusInput(): void {
+            chatView.chatInput.focus();
+        },
+        searchMenuCompletion(id: number, item: SearchMenuItem) {
+            remoteSearchMenuUIOnCompletion(id, item);
         },
     };
 
@@ -489,28 +501,40 @@ document.addEventListener("DOMContentLoaded", async function () {
 });
 
 function watchForDOMChanges(element: HTMLDivElement) {
-    // ignore attribute changes but watch for
-    const config = { attributes: false, childList: true, subtree: true };
-
     // timeout
-    let idleCounter: number = 0;
-
-    // observer callback
-    const observer = new MutationObserver(() => {
-        // increment the idle counter
-        idleCounter++;
-
-        // decrement the idle counter
+    let lastModifiedTime: number = 0;
+    let hasTimeout = false;
+    const scheduleSaveChatHistory = () => {
+        if (hasTimeout) {
+            // Already scheduled.
+            return;
+        }
+        hasTimeout = true;
         setTimeout(() => {
-            if (--idleCounter == 0) {
-                // last one notifies main process
+            hasTimeout = false;
+            const idleTime = Date.now() - lastModifiedTime;
+            if (idleTime >= 3000) {
+                // been idle for 3 seconds, save the chat history
                 getClientAPI().saveChatHistory(element.innerHTML);
+            } else {
+                // not idle long enough, reschedule
+                scheduleSaveChatHistory();
             }
-        }, 3000);
+        });
+    };
+    // observer
+    const observer = new MutationObserver(() => {
+        // Update the last modified time
+        lastModifiedTime = Date.now();
+
+        // schedule to save chat history
+        scheduleSaveChatHistory();
     });
 
+    // ignore attribute changes but watch for
+    const config = { attributes: false, childList: true, subtree: true };
     // start observing
-    observer.observe(element!, config);
+    observer.observe(element, config);
 
     // observer.disconnect();
 }

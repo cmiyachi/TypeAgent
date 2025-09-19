@@ -29,6 +29,11 @@ import { PlayerActions } from "./playerSchema.js";
 import registerDebug from "debug";
 import { resolveMusicDeviceEntity } from "../devices.js";
 import { getUserDevices } from "../endpoints.js";
+import {
+    addUserDataStrings,
+    getPlaylistsFromUserData,
+    getUserDataCompletions,
+} from "../userData.js";
 
 const debugSpotify = registerDebug("typeagent:spotify");
 
@@ -183,6 +188,18 @@ async function validateTrack(
     album: string | undefined,
     context: IClientContext,
 ) {
+    if (artists === undefined && album === undefined) {
+        const data = context.userData?.data;
+        if (data && data.tracks) {
+            if (data.nameMap === undefined) {
+                addUserDataStrings(data);
+            }
+            // if user data has exact match return true
+            if (data.nameMap!.get(trackName.toLocaleLowerCase())) {
+                return true;
+            }
+        }
+    }
     const resolvedArtists = artists
         ? await resolveArtists(artists, context)
         : [];
@@ -253,6 +270,20 @@ async function validateAlbum(
 }
 
 async function validateArtist(artistName: string, context: IClientContext) {
+    // if user data has exact match return true
+    const userData = context.userData;
+    if (userData && userData.data) {
+        const artists = userData.data.artists;
+        if (artists) {
+            if (!userData.data.nameMap) {
+                addUserDataStrings(userData.data);
+            }
+            if (userData.data.nameMap!.get(artistName.toLocaleLowerCase())) {
+                return true;
+            }
+        }
+    }
+
     const data = await searchArtists(artistName, context);
 
     if (data && data.artists && data.artists.items.length > 0) {
@@ -343,22 +374,25 @@ async function getPlayerActionCompletion(
             break;
         case "playGenre":
             break;
+        case "getPlaylist":
+        case "deletePlaylist":
+            if (propertyName === "parameters.name") {
+                if (userData.data.playlists === undefined) {
+                    await getPlaylistsFromUserData(
+                        clientContext.service,
+                        userData.data,
+                    );
+                }
+                if (userData.data.playlists) {
+                    const names = userData.data.playlists
+                        .map((pl) => pl.name)
+                        .sort();
+                    result.push(...names);
+                }
+            }
+            return result;
     }
 
-    if (track) {
-        for (const track of userData.data.tracks.values()) {
-            result.push(track.name);
-        }
-    }
-    if (album) {
-        for (const album of userData.data.albums.values()) {
-            result.push(album.name);
-        }
-    }
-    if (artist) {
-        for (const artist of userData.data.artists.values()) {
-            result.push(artist.name);
-        }
-    }
+    result.push(...getUserDataCompletions(userData.data, track, artist, album));
     return result;
 }

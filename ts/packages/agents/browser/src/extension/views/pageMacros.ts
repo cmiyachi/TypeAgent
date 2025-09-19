@@ -44,7 +44,29 @@ class ActionDiscoveryPanel {
         launchUrl = await this.getActiveTabUrl();
         await this.updateConnectionStatus();
         await this.loadAutoDiscoverySettings();
-        await this.requestSchemaUpdate();
+
+        // Only run schema update for HTTP/HTTPS URLs
+        if (
+            launchUrl &&
+            (launchUrl.startsWith("http://") ||
+                launchUrl.startsWith("https://"))
+        ) {
+            await this.requestSchemaUpdate();
+        } else {
+            console.log(
+                "Skipping initial schema update for non-HTTP/HTTPS URL:",
+                launchUrl,
+            );
+            const itemsList = document.getElementById(
+                "detectedSchemaItemsList",
+            ) as HTMLElement;
+            showEmptyState(
+                itemsList,
+                "Action detection not available for this page type",
+                "bi-exclamation-circle",
+            );
+        }
+
         await this.updateUserActionsUI();
     }
 
@@ -88,23 +110,19 @@ class ActionDiscoveryPanel {
 
     private async updateConnectionStatus() {
         const statusElement = document.getElementById("connectionStatus")!;
-        const indicator = statusElement.querySelector(".status-indicator")!;
 
         try {
             const response = await chrome.runtime.sendMessage({ type: "ping" });
             this.connectionStatus.connected = true;
-
-            indicator.className = "status-indicator status-connected";
-            statusElement.innerHTML = `
-                <span class="status-indicator status-connected"></span>
-                Connected to TypeAgent
-            `;
+            // Hide connection status when connected
+            statusElement.style.display = "none";
         } catch (error) {
             this.connectionStatus.connected = false;
-            indicator.className = "status-indicator status-idle";
+            // Show disconnection warning
+            statusElement.style.display = "block";
             statusElement.innerHTML = `
                 <span class="status-indicator status-idle"></span>
-                Connection unavailable
+                <span class="text-warning">Connection unavailable</span>
             `;
         }
     }
@@ -113,11 +131,25 @@ class ActionDiscoveryPanel {
         try {
             const settings = await chrome.storage.local.get(["autoDiscovery"]);
             autoDiscoveryEnabled = settings.autoDiscovery || false;
-            (
-                document.getElementById(
-                    "autoDiscoveryToggle",
-                ) as HTMLInputElement
-            ).checked = autoDiscoveryEnabled;
+            const toggle = document.getElementById(
+                "autoDiscoveryToggle",
+            ) as HTMLInputElement;
+            toggle.checked = autoDiscoveryEnabled;
+
+            const toggleContainer = toggle.closest(
+                ".form-check, .toggle-container, .auto-discovery-section",
+            );
+            if (toggleContainer) {
+                (toggleContainer as HTMLElement).style.display = "none";
+            } else {
+                toggle.style.display = "none";
+                const label = document.querySelector(
+                    'label[for="autoDiscoveryToggle"]',
+                );
+                if (label) {
+                    (label as HTMLElement).style.display = "none";
+                }
+            }
         } catch (error) {
             console.error("Error loading auto-discovery settings:", error);
         }
@@ -139,8 +171,26 @@ class ActionDiscoveryPanel {
         launchUrl = await this.getActiveTabUrl();
         await this.updateConnectionStatus();
 
-        if (autoDiscoveryEnabled) {
+        if (
+            autoDiscoveryEnabled &&
+            launchUrl &&
+            (launchUrl.startsWith("http://") ||
+                launchUrl.startsWith("https://"))
+        ) {
             await this.requestSchemaUpdate(true);
+        } else if (autoDiscoveryEnabled) {
+            console.log(
+                "Skipping auto-discovery for non-HTTP/HTTPS URL:",
+                launchUrl,
+            );
+            const itemsList = document.getElementById(
+                "detectedSchemaItemsList",
+            ) as HTMLElement;
+            showEmptyState(
+                itemsList,
+                "Action detection not available for this page type",
+                "bi-exclamation-circle",
+            );
         }
 
         await this.updateUserActionsUI();
@@ -154,6 +204,24 @@ class ActionDiscoveryPanel {
             "refreshDetectedActions",
         ) as HTMLButtonElement;
         const originalHtml = refreshButton.innerHTML;
+
+        // Skip action detection for non-HTTP/HTTPS protocols
+        if (
+            launchUrl &&
+            !launchUrl.startsWith("http://") &&
+            !launchUrl.startsWith("https://")
+        ) {
+            console.log(
+                "Skipping action detection for non-HTTP/HTTPS URL:",
+                launchUrl,
+            );
+            showEmptyState(
+                itemsList,
+                "Action detection not available for this page type",
+                "bi-exclamation-circle",
+            );
+            return;
+        }
 
         showLoadingState(itemsList, "Scanning ...");
         refreshButton.innerHTML =

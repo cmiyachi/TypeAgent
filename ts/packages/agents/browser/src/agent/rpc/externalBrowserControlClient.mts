@@ -53,6 +53,12 @@ export function createExternalBrowserClient(
         closeWebPage: async () => {
             return rpc.invoke("closeWebPage");
         },
+        closeAllWebPages: async () => {
+            return rpc.invoke("closeAllWebPages");
+        },
+        switchTabs: async (...args) => {
+            return rpc.invoke("switchTabs", ...args);
+        },
         goForward: async () => {
             return rpc.invoke("goForward");
         },
@@ -104,6 +110,15 @@ export function createExternalBrowserClient(
         },
         captureScreenshot: async () => {
             return rpc.invoke("captureScreenshot");
+        },
+        getPageTextContent: async () => {
+            return rpc.invoke("getPageTextContent");
+        },
+        getAutoIndexSetting: async () => {
+            return rpc.invoke("getAutoIndexSetting");
+        },
+        getBrowserSettings: async () => {
+            return rpc.invoke("getBrowserSettings");
         },
     };
 }

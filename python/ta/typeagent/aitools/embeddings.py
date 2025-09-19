@@ -10,6 +10,7 @@ from numpy.typing import NDArray
 from openai import AsyncOpenAI, AsyncAzureOpenAI, OpenAIError
 
 from .auth import get_shared_token_provider, AzureTokenProvider
+from .utils import timelog
 
 type NormalizedEmbedding = NDArray[np.float32]  # A single embedding
 type NormalizedEmbeddings = NDArray[np.float32]  # An array of embeddings
@@ -76,11 +77,11 @@ class AsyncEmbeddingModel:
             openai_key_name = "OPENAI_API_KEY"
             azure_key_name = "AZURE_OPENAI_API_KEY"
             if os.getenv(openai_key_name):
-                print(f"Using OpenAI")
-                self.async_client = AsyncOpenAI()
+                with timelog(f"Using OpenAI"):
+                    self.async_client = AsyncOpenAI()
             elif azure_api_key := os.getenv(azure_key_name):
-                print("Using Azure OpenAI")
-                self._setup_azure(azure_api_key)
+                with timelog("Using Azure OpenAI"):
+                    self._setup_azure(azure_api_key)
             else:
                 raise ValueError(
                     f"Neither {openai_key_name} nor {azure_key_name} found in environment."
@@ -130,7 +131,7 @@ class AsyncEmbeddingModel:
     def add_embedding(self, key: str, embedding: NormalizedEmbedding) -> None:
         existing = self._embedding_cache.get(key)
         if existing is not None:
-            assert existing == embedding
+            assert np.array_equal(existing, embedding)
         else:
             self._embedding_cache[key] = embedding
 
@@ -150,7 +151,14 @@ class AsyncEmbeddingModel:
             extra_args["dimensions"] = self.embedding_size
         if self.async_client is None:
             # Compute a random embedding for testing purposes.
-            # It's based on hashing.
+
+            def hashish(s: str) -> int:
+                # Primitive deterministic hash function (hash() varies per run)
+                h = 0
+                for ch in s:
+                    h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+                return h
+
             prime = 1961
             fake_data: list[NormalizedEmbedding] = []
             for item in input:
@@ -161,7 +169,7 @@ class AsyncEmbeddingModel:
                 for i in range(self.embedding_size):
                     cut = i % length
                     scrambled = item[cut:] + item[:cut]
-                    hashed = hash(scrambled)
+                    hashed = hashish(scrambled)
                     reduced = (hashed % prime) / prime
                     floats.append(reduced)
                 array = np.array(floats, dtype=np.float64)
@@ -175,6 +183,8 @@ class AsyncEmbeddingModel:
             result = np.array(fake_data, dtype=np.float32)
             return result
         else:
+            # TODO: Split in batches of 2048 inputs if too long;
+            # or smaller if inputs are large.
             data = (
                 await self.async_client.embeddings.create(
                     input=input,
@@ -220,24 +230,3 @@ class AsyncEmbeddingModel:
         return np.array(embeddings, dtype=np.float32).reshape(
             (len(keys), self.embedding_size)
         )
-
-
-async def main():
-    from . import utils
-
-    utils.load_dotenv()
-
-    async_model = AsyncEmbeddingModel()
-    e = await async_model.get_embeddings([])
-    print(repr(e))
-    inputs = ["Hello, world", "Foo bar baz"]
-    embeddings = await async_model.get_embeddings(inputs)
-    print(repr(embeddings))
-    for input, embedding in zip(inputs, embeddings, strict=True):
-        print(f"{input}: {len(embedding)} {embedding[:5]}...{embedding[-5:]}")
-
-
-if __name__ == "__main__":
-    import asyncio
-
-    asyncio.run(main())

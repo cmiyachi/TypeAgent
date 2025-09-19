@@ -32,7 +32,8 @@
       "runtimeArgs": ["--sourcemap"],
       "env": {
         "REMOTE_DEBUGGING_PORT": "9222"
-      }
+      },
+      "outputCapture": "std"
     },
     {
       "name": "Player Service",
@@ -331,7 +332,9 @@
       ],
       //"cwd": "${workspaceFolder}/packages/knowpro",
       //"cwd": "${workspaceFolder}/packages/memory/storage",
-      "cwd": "${workspaceFolder}/packages/memory/conversation",
+      //"cwd": "${workspaceFolder}/packages/memory/conversation",
+      //"cwd": "${workspaceFolder}/packages/actionSchema",
+      "cwd": "${workspaceFolder}/packages/defaultAgentProvider",
       //"cwd": "${workspaceFolder}/packages/knowledgeProcessor",
       //"cwd": "${workspaceFolder}/packages/aiclient",
       "console": "integratedTerminal",
@@ -408,6 +411,7 @@
       "request": "launch",
       "skipFiles": ["<node_internals>/**"],
       "program": "${workspaceFolder}/examples/websiteAliases/src/main.ts",
+      "args": [],
       "console": "externalTerminal",
       "outFiles": ["${workspaceFolder}/**/*.js"]
     },       

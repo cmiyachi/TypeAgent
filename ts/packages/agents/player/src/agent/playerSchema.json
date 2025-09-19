@@ -39,6 +39,36 @@
     },
     "getFavorites": {
       "count": "number"
+    },
+    "getPlaylist": {
+      "name": "checked_wildcard"
+    },
+    "deletePlaylist": {
+      "name": "checked_wildcard"
+    }
+  },
+  "paramCompletionEmojis": {
+    "playTrack": {
+      "trackName": "🎶",
+      "artists.*": "🎼"
+    },
+    "playAlbum": {
+      "albumName": "💿",
+      "artists.*": "🎼"
+    },
+    "playAlbumTrack": {
+      "albumName": "💿",
+      "trackName": "🎶",
+      "artists.*": "🎼"
+    },
+    "playArtist": {
+      "artist": "🎼"
+    },
+    "getPlaylist": {
+      "name": "📃"
+    },
+    "deletePlaylist": {
+      "name": "📃"
     }
   }
 }

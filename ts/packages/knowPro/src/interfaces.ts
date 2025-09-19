@@ -50,7 +50,7 @@ export interface IMessage extends IKnowledgeSource {
     /**
      * (Optional) tags associated with the message
      */
-    tags: string[] | MessageTag[];
+    tags: MessageTag[];
     /**
      * (Future) Information about the deletion of the message.
      */
@@ -88,7 +88,7 @@ export interface DeletionInfo {
 /**
  * Types of knowledge objects {@link Knowledge}
  */
-export type KnowledgeType = "entity" | "action" | "topic" | "tag" | "sTag"; // sTag: Experimental ;
+export type KnowledgeType = "entity" | "action" | "topic" | "tag" | "sTag";
 /**
  * Knowledge objects
  */
@@ -740,6 +740,7 @@ export interface IReadonlyCollection<T, TOrdinal = number> extends Iterable<T> {
     get(ordinal: TOrdinal): T;
     getMultiple(ordinals: TOrdinal[]): T[];
     getSlice(start: TOrdinal, end: TOrdinal): T[];
+    getAll(): T[];
 }
 
 /**

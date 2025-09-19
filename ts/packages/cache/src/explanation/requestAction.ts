@@ -40,10 +40,7 @@ export function equalNormalizedParamValue(
     return a === b || normalizeParamValue(a) === normalizeParamValue(b);
 }
 
-export function equalNormalizedParamObject(
-    a: ParamObjectType = {},
-    b: ParamObjectType = {},
-) {
+export function equalNormalizedObject(a: object = {}, b: object = {}) {
     return (
         normalizeParamString(JSON.stringify(a)) ===
         normalizeParamString(JSON.stringify(b))
@@ -106,7 +103,7 @@ export function createExecutableAction(
 const format =
     "'<request> => translator.action(<parameters>)' or '<request> => [ translator.action1(<parameters1>), translator.action2(<parameters2>), ... ]'";
 
-function parseFullActionNameParts(fullActionName: string) {
+export function splitFullActionName(fullActionName: string) {
     const parts = fullActionName.split(".");
     const schemaName = parts.slice(0, -1).join(".");
     const actionName = parts.at(-1)!;
@@ -121,7 +118,7 @@ function parseAction(action: string, index: number = -1) {
         );
     }
     const functionName = action.substring(0, leftParan);
-    const { schemaName, actionName } = parseFullActionNameParts(functionName);
+    const { schemaName, actionName } = splitFullActionName(functionName);
     if (!actionName) {
         throw new Error(
             `${index !== -1 ? `Action ${index}: ` : ""}Unable to parse action name from '${functionName}'. Input must be in the form of ${format}`,
@@ -197,9 +194,11 @@ function executableActionsToString(actions: ExecutableAction[]): string {
 }
 
 function fromJsonAction(actionJSON: JSONAction) {
-    const { schemaName, actionName } = parseFullActionNameParts(
-        actionJSON.fullActionName,
-    );
+    const { schemaName, actionName } =
+        actionJSON.fullActionName !== undefined
+            ? splitFullActionName(actionJSON.fullActionName)
+            : { schemaName: undefined as any, actionName: undefined as any };
+
     return createExecutableAction(
         schemaName,
         actionName,

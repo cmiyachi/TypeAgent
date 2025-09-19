@@ -9,6 +9,10 @@ import {
     EventManager,
 } from "./knowledgeUtilities";
 import { conversation as kpLib } from "knowledge-processor";
+import type {
+    KnowledgeExtractionProgress,
+    KnowledgeProgressCallback,
+} from "../interfaces/knowledgeExtraction.types";
 
 interface KnowledgeData {
     entities: Entity[];
@@ -107,9 +111,18 @@ class KnowledgePanel {
     private currentUrl: string = "";
     private isConnected: boolean = false;
     private knowledgeData: KnowledgeData | null = null;
+    private extractedKnowledgeData: KnowledgeData | null = null;
     private extractionSettings: ExtractionSettings;
     private aiModelAvailable: boolean = false;
     private connectionStatusCallback?: (connected: boolean) => void;
+
+    // Streaming-related properties
+    private streamingEnabled: boolean = false;
+    private currentExtractionId: string | null = null;
+    private streamingState: {
+        startTime: number;
+        currentData: KnowledgeData;
+    } | null = null;
 
     constructor() {
         this.extractionSettings = {
@@ -124,6 +137,8 @@ class KnowledgePanel {
         await this.checkAIModelAvailability();
 
         this.setupEventListeners();
+        this.setupStreamingListeners();
+        this.setupButtonIcons(); // Set up button icons after DOM is ready
         await this.loadCurrentPageInfo();
         await this.loadAutoIndexSetting();
         await this.checkConnectionStatus();
@@ -132,11 +147,28 @@ class KnowledgePanel {
         await this.loadExtractionSettings();
     }
 
+    private setupButtonIcons() {
+        // Change the extract button to use a refresh icon
+        const extractButton = document.getElementById(
+            "extractKnowledge",
+        ) as HTMLButtonElement;
+        if (extractButton) {
+            extractButton.innerHTML =
+                '<i class="bi bi-arrow-clockwise me-2"></i>Refresh';
+        }
+    }
+
     private setupEventListeners() {
         document
             .getElementById("extractKnowledge")!
             .addEventListener("click", () => {
                 this.extractKnowledge();
+            });
+
+        document
+            .getElementById("saveKnowledge")!
+            .addEventListener("click", () => {
+                this.saveExtractedKnowledge();
             });
 
         document.getElementById("indexPage")!.addEventListener("click", () => {
@@ -301,6 +333,23 @@ class KnowledgePanel {
                 "autoIndexToggle",
             ) as HTMLInputElement;
             toggle.checked = enabled;
+
+            // Hide the auto-index toggle as per requirements
+            const toggleContainer = toggle.closest(
+                ".form-check, .toggle-container, .auto-index-section",
+            );
+            if (toggleContainer) {
+                (toggleContainer as HTMLElement).style.display = "none";
+            } else {
+                // Fallback: hide the toggle itself and its label
+                toggle.style.display = "none";
+                const label = document.querySelector(
+                    'label[for="autoIndexToggle"]',
+                );
+                if (label) {
+                    (label as HTMLElement).style.display = "none";
+                }
+            }
         } catch (error) {
             console.error("Error loading auto-index setting:", error);
         }
@@ -330,16 +379,20 @@ class KnowledgePanel {
         const button = document.getElementById(
             "extractKnowledge",
         ) as HTMLButtonElement;
+        const saveButton = document.getElementById(
+            "saveKnowledge",
+        ) as HTMLButtonElement;
         const originalContent = button.innerHTML;
 
         // Show extracting state with progress indicator
         button.innerHTML =
             '<i class="bi bi-hourglass-split spinner-grow spinner-grow-sm me-2"></i>Extracting...';
         button.disabled = true;
+        saveButton.disabled = true;
         button.classList.add("btn-warning");
         button.classList.remove("btn-primary");
 
-        this.showKnowledgeLoading();
+        this.showStreamingProgress();
 
         try {
             // Validate mode selection before extraction with defensive check
@@ -360,67 +413,42 @@ class KnowledgePanel {
 
             const startTime = Date.now();
 
-            const response = await extensionService.extractPageKnowledge(
-                this.currentUrl,
-                this.extractionSettings.mode,
-                this.extractionSettings,
-            );
+            // Initialize streaming state
+            this.streamingState = {
+                startTime,
+                currentData: {
+                    entities: [],
+                    relationships: [],
+                    keyTopics: [],
+                    summary: "",
+                    contentActions: [],
+                    detectedActions: [],
+                    actionSummary: undefined,
+                    contentMetrics: { readingTime: 0, wordCount: 0 },
+                },
+            };
 
-            const processingTime = Date.now() - startTime;
+            // Use streaming API
+            const extractionId = `extraction_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            this.currentExtractionId = extractionId;
 
-            this.knowledgeData = response.knowledge;
-            if (this.knowledgeData) {
-                // Check for insufficient content case
-                const isInsufficientContent = this.checkInsufficientContent(
-                    this.knowledgeData,
+            const response =
+                await extensionService.extractPageKnowledgeStreaming(
+                    this.currentUrl,
+                    this.extractionSettings.mode,
+                    this.extractionSettings,
+                    true,
+                    extractionId,
                 );
 
-                if (isInsufficientContent) {
-                    // Show error state for insufficient content
-                    button.innerHTML =
-                        '<i class="bi bi-exclamation-triangle me-2"></i>Insufficient Content';
-                    button.classList.remove("btn-warning");
-                    button.classList.add("btn-warning");
-
-                    this.showInsufficientContentError();
-
-                    notificationManager.showEnhancedNotification(
-                        "warning",
-                        "Insufficient Content",
-                        "This page doesn't have enough content to extract meaningful knowledge or its content is not available. Try refreshing the page.",
-                        "bi-exclamation-triangle",
-                    );
-
-                    // Brief delay to show warning state
-                    await new Promise((resolve) => setTimeout(resolve, 2000));
-                    return; // Don't render empty knowledge modules
-                }
-
-                // Show success state briefly
-                button.innerHTML =
-                    '<i class="bi bi-check-circle me-2"></i>Extracted!';
-                button.classList.remove("btn-warning");
-                button.classList.add("btn-success");
-
-                await this.renderKnowledgeResults(this.knowledgeData);
-                this.showExtractionInfo();
-
-                // Show detailed success notification
-                const entityCount = this.knowledgeData.entities?.length || 0;
-                const topicCount = this.knowledgeData.keyTopics?.length || 0;
-                const relationshipCount =
-                    this.knowledgeData.relationships?.length || 0;
-
-                notificationManager.showEnhancedNotification(
-                    "success",
-                    "Knowledge Extracted Successfully!",
-                    `Found ${entityCount} entities, ${topicCount} topics, ${relationshipCount} relationships using ${this.extractionSettings.mode} mode in ${Math.round(processingTime / 1000)}s`,
-                    "bi-brain",
+            if (!response) {
+                throw new Error(
+                    response?.error || "Failed to start streaming extraction",
                 );
-
-                // Brief delay to show success state
-                await new Promise((resolve) => setTimeout(resolve, 1500));
             }
+
+            // Exit early for streaming - completion will be handled by streaming callbacks
+            return;
         } catch (error) {
             console.error("Error extracting knowledge:", error);
 
@@ -448,8 +476,9 @@ class KnowledgePanel {
             // Brief delay to show error state
             await new Promise((resolve) => setTimeout(resolve, 1000));
         } finally {
-            // Restore original button state
-            button.innerHTML = originalContent;
+            // Restore refresh icon button state
+            button.innerHTML =
+                '<i class="bi bi-arrow-clockwise me-2"></i>Refresh';
             button.disabled = false;
             button.classList.remove("btn-warning", "btn-success", "btn-danger");
             button.classList.add("btn-primary");
@@ -568,6 +597,130 @@ class KnowledgePanel {
             button.classList.remove("btn-warning", "btn-success", "btn-danger");
             button.classList.add("btn-outline-primary");
         }
+    }
+
+    private enableSaveButton() {
+        const saveButton = document.getElementById(
+            "saveKnowledge",
+        ) as HTMLButtonElement;
+        saveButton.disabled = false;
+        saveButton.classList.remove("btn-outline-secondary");
+        saveButton.classList.add("btn-outline-success");
+        saveButton.title = "Save extracted knowledge to index";
+
+        saveButton.classList.add("pulse-animation");
+        setTimeout(() => {
+            saveButton.classList.remove("pulse-animation");
+        }, 2000);
+    }
+
+    private disableSaveButton() {
+        const saveButton = document.getElementById(
+            "saveKnowledge",
+        ) as HTMLButtonElement;
+        saveButton.disabled = true;
+        saveButton.classList.remove("btn-outline-success", "btn-success");
+        saveButton.classList.add("btn-outline-secondary");
+        saveButton.title = "Extract knowledge first";
+    }
+
+    private async saveExtractedKnowledge() {
+        if (!this.extractedKnowledgeData) {
+            notificationManager.showWarning("Please extract knowledge first");
+            return;
+        }
+
+        const saveButton = document.getElementById(
+            "saveKnowledge",
+        ) as HTMLButtonElement;
+        const originalContent = saveButton.innerHTML;
+
+        saveButton.innerHTML =
+            '<i class="bi bi-hourglass-split spinner-grow spinner-grow-sm"></i>';
+        saveButton.disabled = true;
+        saveButton.classList.add("btn-warning");
+        saveButton.classList.remove("btn-outline-success");
+
+        try {
+            const startTime = Date.now();
+
+            const response = await extensionService.indexPageContent(
+                this.currentUrl,
+                this.extractionSettings.mode,
+                this.extractedKnowledgeData,
+            );
+
+            const processingTime = Date.now() - startTime;
+
+            saveButton.innerHTML = '<i class="bi bi-check-circle"></i>';
+            saveButton.classList.remove("btn-warning");
+            saveButton.classList.add("btn-success");
+
+            let actualEntityCount = await this.waitForIndexCompletion();
+
+            notificationManager.showEnhancedNotification(
+                "success",
+                "Knowledge Saved Successfully!",
+                `Saved ${actualEntityCount} entities to your knowledge index in ${Math.round(processingTime / 1000)}s`,
+                "bi-database-check",
+            );
+
+            await this.refreshPageStatusAfterIndexing();
+
+            this.extractedKnowledgeData = null;
+
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+
+            this.disableSaveButton();
+            saveButton.innerHTML = originalContent;
+        } catch (error) {
+            console.error("Error saving knowledge:", error);
+
+            saveButton.innerHTML = '<i class="bi bi-exclamation-triangle"></i>';
+            saveButton.classList.remove("btn-warning");
+            saveButton.classList.add("btn-danger");
+
+            notificationManager.showEnhancedNotification(
+                "danger",
+                "Save Failed",
+                (error as Error).message || "Failed to save knowledge to index",
+                "bi-exclamation-triangle",
+            );
+
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+
+            saveButton.innerHTML = originalContent;
+            saveButton.disabled = false;
+            saveButton.classList.remove("btn-warning", "btn-danger");
+            saveButton.classList.add("btn-outline-success");
+        }
+    }
+
+    private async waitForIndexCompletion(): Promise<number> {
+        let actualEntityCount = 0;
+        let attempts = 0;
+        const maxAttempts = 10;
+
+        while (attempts < maxAttempts) {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            try {
+                const status = await extensionService.getPageIndexStatus(
+                    this.currentUrl,
+                );
+                if (status.isIndexed && status.entityCount !== undefined) {
+                    actualEntityCount = status.entityCount;
+                    break;
+                }
+            } catch (error) {
+                console.warn(
+                    "Error checking index status during entity count polling:",
+                    error,
+                );
+            }
+            attempts++;
+        }
+
+        return actualEntityCount;
     }
 
     private async submitQuery() {
@@ -713,17 +866,12 @@ class KnowledgePanel {
         const knowledgeSection = document.getElementById("knowledgeSection")!;
         knowledgeSection.className = "";
         knowledgeSection.innerHTML = `
-            ${this.hasContentMetrics(knowledge) ? this.renderContentMetricsCard() : ""}
             ${this.hasRelatedContent(knowledge) ? this.renderRelatedContentCard() : ""}
             ${this.renderEntitiesCard()}
             ${this.renderRelationshipsCard()}
             ${this.renderTopicsCard()}
             ${knowledge.detectedActions && knowledge.detectedActions.length > 0 ? this.renderUserActionsCard() : ""}
         `;
-
-        if (this.hasContentMetrics(knowledge)) {
-            this.renderContentMetrics(knowledge.contentMetrics);
-        }
 
         if (this.hasRelatedContent(knowledge)) {
             this.renderRelatedContent(knowledge);
@@ -738,6 +886,37 @@ class KnowledgePanel {
                 knowledge.actionSummary,
             );
         }
+    }
+
+    private escapeHtml(text: string): string {
+        const div = document.createElement("div");
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    private resolveCustomProtocolUrl(url: string): string {
+        if (url.startsWith("typeagent-browser://")) {
+            const customUrl = new URL(url);
+            const customPath = customUrl.pathname;
+            const queryString = customUrl.search;
+
+            const libraryMapping: Record<string, string> = {
+                "/annotationsLibrary.html": "views/annotationsLibrary.html",
+                "/knowledgeLibrary.html": "views/knowledgeLibrary.html",
+                "/macrosLibrary.html": "views/macrosLibrary.html",
+                "/entityGraphView.html": "views/entityGraphView.html",
+            };
+
+            const extensionPath = libraryMapping[customPath];
+            if (extensionPath) {
+                // Append query parameters to preserve entity/topic selection
+                return chrome.runtime.getURL(extensionPath) + queryString;
+            } else {
+                throw new Error(`Unknown library page: ${customPath}`);
+            }
+        }
+
+        return url;
     }
 
     private renderEntities(entities: Entity[]) {
@@ -757,12 +936,20 @@ class KnowledgePanel {
         }
 
         container.innerHTML = entities
-            .map(
-                (entity) => `
+            .map((entity) => {
+                const customUrl = `typeagent-browser://views/entityGraphView.html?entity=${encodeURIComponent(entity.name)}`;
+                const entityUrl = this.resolveCustomProtocolUrl(customUrl);
+                return `
             <div class="d-flex justify-content-between align-items-center mb-2">
                 <div>
-                    <span class="fw-semibold">${entity.name}</span>
-                    <span class="entity-badge badge bg-secondary">${entity.type}</span>
+                    <a href="${entityUrl}" 
+                       target="_blank"
+                       class="fw-semibold text-decoration-none" 
+                       style="color: #0d6efd; transition: color 0.2s;"
+                       title="Click to view entity graph">
+                        ${this.escapeHtml(entity.name)}
+                    </a>
+                    <span class="entity-badge badge bg-secondary ms-2">${entity.type}</span>
                 </div>
                 <div>
                     <div class="progress" style="width: 50px; height: 4px;">
@@ -771,8 +958,8 @@ class KnowledgePanel {
                 </div>
             </div>
             ${entity.description ? `<small class="text-muted">${entity.description}</small><hr class="my-2">` : ""}
-        `,
-            )
+        `;
+            })
             .join("");
     }
 
@@ -786,7 +973,7 @@ class KnowledgePanel {
             container.innerHTML = `
                 <div class="text-muted text-center">
                     <i class="bi bi-info-circle"></i>
-                    No entity actions identified
+                    No relationships identified
                 </div>
             `;
             return;
@@ -814,18 +1001,26 @@ class KnowledgePanel {
             container.innerHTML = `
                 <div class="text-muted text-center">
                     <i class="bi bi-info-circle"></i>
-                    No key topics identified
+                    No topics identified
                 </div>
             `;
             return;
         }
 
         container.innerHTML = topics
-            .map(
-                (topic) => `
-            <span class="badge bg-primary me-1 mb-1">${topic}</span>
-        `,
-            )
+            .map((topic) => {
+                const customUrl = `typeagent-browser://views/entityGraphView.html?topic=${encodeURIComponent(topic)}`;
+                const topicUrl = this.resolveCustomProtocolUrl(customUrl);
+                return `
+            <a href="${topicUrl}" 
+               target="_blank"
+               class="badge bg-primary me-1 mb-1 text-decoration-none" 
+               style="transition: background-color 0.2s;"
+               title="Click to view topic graph">
+                ${this.escapeHtml(topic)}
+            </a>
+        `;
+            })
             .join("");
     }
 
@@ -962,74 +1157,6 @@ class KnowledgePanel {
         }
     }
 
-    // Enhanced knowledge extraction status display with advanced integration
-    private showExtractionInfo() {
-        if (!this.knowledgeData) return;
-
-        const infoDiv = document.createElement("div");
-        infoDiv.className = "alert alert-info mt-2";
-
-        // Calculate knowledge quality metrics
-        const qualityMetrics = this.calculateKnowledgeQuality(
-            this.knowledgeData,
-        );
-
-        let content = `<small>
-            <i class="bi bi-cpu me-1"></i>
-            <strong>Enhanced Extraction</strong> using <strong>${this.extractionSettings.mode}</strong> mode
-            <div class="mt-2">
-                <div class="d-flex align-items-center justify-content-between">
-                    <span>Knowledge Quality:</span>
-                    <div class="d-flex align-items-center">
-                        <div class="progress me-2" style="width: 100px; height: 6px;">
-                            <div class="progress-bar bg-${qualityMetrics.color}" 
-                                 style="width: ${qualityMetrics.score}%" 
-                                 title="Overall quality: ${qualityMetrics.score}%">
-                            </div>
-                        </div>
-                        <span class="badge bg-${qualityMetrics.color}">${qualityMetrics.label}</span>
-                    </div>
-                </div>
-                <div class="row mt-2 g-2">
-                    <div class="col-4 text-center">
-                        <div class="fw-semibold text-${qualityMetrics.entities.color}">${this.knowledgeData.entities?.length || 0}</div>
-                        <small class="text-muted">Entities</small>
-                    </div>
-                    <div class="col-4 text-center">
-                        <div class="fw-semibold text-${qualityMetrics.relationships.color}">${this.knowledgeData.relationships?.length || 0}</div>
-                        <small class="text-muted">Relations</small>
-                    </div>
-                    <div class="col-4 text-center">
-                        <div class="fw-semibold text-${qualityMetrics.topics.color}">${this.knowledgeData.keyTopics?.length || 0}</div>
-                        <small class="text-muted">Topics</small>
-                    </div>
-                </div>
-            </div>`;
-
-        // Show enhanced capabilities if detected
-        if (
-            this.knowledgeData.detectedActions &&
-            this.knowledgeData.detectedActions.length > 0
-        ) {
-            content += `
-                <div class="mt-2 p-2 bg-light rounded">
-                    <small class="text-success">
-                        <i class="bi bi-lightning-fill me-1"></i>
-                        <strong>Action Detection:</strong> ${this.knowledgeData.detectedActions.length} interactive elements identified
-                    </small>
-                </div>`;
-        }
-
-        content += "</small>";
-        infoDiv.innerHTML = content;
-
-        const knowledgeSection = document.getElementById("knowledgeSection")!;
-        const firstCard = knowledgeSection.querySelector(".knowledge-card");
-        if (firstCard) {
-            knowledgeSection.insertBefore(infoDiv, firstCard);
-        }
-    }
-
     private async checkConnectionStatus() {
         try {
             const response = await extensionService.checkConnection();
@@ -1044,19 +1171,16 @@ class KnowledgePanel {
 
     private updateConnectionStatus() {
         const statusElement = document.getElementById("connectionStatus")!;
-        const indicator = statusElement.querySelector(".status-indicator")!;
 
         if (this.isConnected) {
-            indicator.className = "status-indicator status-connected";
-            statusElement.innerHTML = `
-                <span class="status-indicator status-connected"></span>
-                Connected to TypeAgent
-            `;
+            // Hide connection status when connected
+            statusElement.style.display = "none";
         } else {
-            indicator.className = "status-indicator status-disconnected";
+            // Show disconnection warning
+            statusElement.style.display = "block";
             statusElement.innerHTML = `
                 <span class="status-indicator status-disconnected"></span>
-                Disconnected from TypeAgent
+                <span class="text-warning">Disconnected from TypeAgent</span>
             `;
         }
     }
@@ -1085,6 +1209,9 @@ class KnowledgePanel {
     private async onTabChange() {
         await this.loadCurrentPageInfo();
         await this.loadFreshKnowledge();
+
+        this.extractedKnowledgeData = null;
+        this.disableSaveButton();
     }
 
     private async loadFreshKnowledge() {
@@ -1095,8 +1222,13 @@ class KnowledgePanel {
 
             if (indexStatus.isIndexed) {
                 await this.loadIndexedKnowledge();
+                this.disableSaveButton();
             } else {
                 this.showNotIndexedState();
+                this.disableSaveButton();
+
+                // Auto-start extraction if no saved knowledge exists
+                this.extractKnowledge();
             }
         } catch (error) {
             console.error("Error loading fresh knowledge:", error);
@@ -1148,7 +1280,6 @@ class KnowledgePanel {
                 this.knowledgeData = response.knowledge;
                 if (this.knowledgeData) {
                     await this.renderKnowledgeResults(this.knowledgeData);
-                    this.showIndexedKnowledgeIndicator();
                 }
             } else {
                 this.showNotIndexedState();
@@ -1156,29 +1287,6 @@ class KnowledgePanel {
         } catch (error) {
             console.error("Error loading indexed knowledge:", error);
             this.showConnectionError();
-        }
-    }
-
-    private showIndexedKnowledgeIndicator() {
-        const knowledgeSection = document.getElementById("knowledgeSection")!;
-        const firstCard = knowledgeSection.querySelector(".knowledge-card");
-
-        if (firstCard) {
-            const indicatorDiv = document.createElement("div");
-            indicatorDiv.className = "alert alert-info mt-2";
-            indicatorDiv.innerHTML = `
-                <small>
-                    <i class="bi bi-database-check me-1"></i>
-                    <strong>Indexed Knowledge</strong> - This information was retrieved from your knowledge index
-                    <div class="mt-1">
-                        <span class="badge bg-success">
-                            <i class="bi bi-check-circle me-1"></i>Available Offline
-                        </span>
-                    </div>
-                </small>
-            `;
-
-            knowledgeSection.insertBefore(indicatorDiv, firstCard);
         }
     }
 
@@ -1208,11 +1316,11 @@ class KnowledgePanel {
             "relationshipsContainer",
             TemplateHelpers.createEmptyState(
                 "bi bi-info-circle",
-                "No entity actions found yet",
+                "No relationships found yet",
             ),
         );
         return TemplateHelpers.createCard(
-            "Entity Actions",
+            "Relationships",
             content,
             "bi bi-diagram-3",
             "relationshipsCount",
@@ -1227,11 +1335,7 @@ class KnowledgePanel {
                 "No topics identified yet",
             ),
         );
-        return TemplateHelpers.createCard(
-            "Key Topics",
-            content,
-            "bi bi-bookmark",
-        );
+        return TemplateHelpers.createCard("Topics", content, "bi bi-bookmark");
     }
 
     // Template utility functions for knowledge panel
@@ -1252,22 +1356,6 @@ class KnowledgePanel {
                 <div id="pageStatus" class="ms-2">${status}</div>
             </div>
         `;
-    }
-
-    // Content Metrics Card component with enhanced visualization
-    private renderContentMetricsCard(): string {
-        const content = this.createContainer(
-            "contentMetricsContainer",
-            TemplateHelpers.createEmptyState(
-                "bi bi-info-circle",
-                "No content metrics available",
-            ),
-        );
-        return TemplateHelpers.createCard(
-            "Content Analysis",
-            content,
-            "bi bi-bar-chart-line",
-        );
     }
 
     // Related Content Card component
@@ -1300,73 +1388,6 @@ class KnowledgePanel {
             "bi bi-lightning",
             "actionsCount",
         );
-    }
-
-    // Render enhanced content metrics with visual indicators
-    private renderContentMetrics(metrics: any) {
-        const container = document.getElementById("contentMetricsContainer")!;
-
-        // Calculate derived metrics
-        const readingTimeCategory = this.getReadingTimeCategory(
-            metrics.readingTime,
-        );
-        const wordCountCategory = this.getWordCountCategory(metrics.wordCount);
-
-        container.innerHTML = `
-            <!-- Reading Time Section -->
-            <div class="metric-section mb-4">
-                <div class="d-flex align-items-center justify-content-between mb-2">
-                    <h6 class="mb-0 text-primary">
-                        <i class="bi bi-clock me-2"></i>Reading Time
-                    </h6>
-                    <span class="badge bg-${readingTimeCategory.color}">${readingTimeCategory.label}</span>
-                </div>
-                <div class="metric-visual-container">
-                    <div class="d-flex align-items-center mb-2">
-                        <div class="reading-time-display me-3">
-                            <span class="h4 mb-0 text-primary">${metrics.readingTime}</span>
-                            <small class="text-muted ms-1">min</small>
-                        </div>
-                        <div class="flex-grow-1">
-                            <div class="progress" style="height: 8px;">
-                                <div class="progress-bar bg-${readingTimeCategory.color}" 
-                                     style="width: ${Math.min(metrics.readingTime * 10, 100)}%"
-                                     title="${metrics.readingTime} minutes">
-                                </div>
-                            </div>
-                            <small class="text-muted">${readingTimeCategory.description}</small>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Word Count Section -->
-            <div class="metric-section mb-4">
-                <div class="d-flex align-items-center justify-content-between mb-2">
-                    <h6 class="mb-0 text-info">
-                        <i class="bi bi-file-text me-2"></i>Content Volume
-                    </h6>
-                    <span class="badge bg-${wordCountCategory.color}">${wordCountCategory.label}</span>
-                </div>
-                <div class="metric-visual-container">
-                    <div class="row text-center mb-2">
-                        <div class="col-6">
-                            <div class="metric-card p-2 bg-light rounded">
-                                <div class="h5 mb-0 text-info">${metrics.wordCount.toLocaleString()}</div>
-                                <small class="text-muted">Words</small>
-                            </div>
-                        </div>
-                        <div class="col-6">
-                            <div class="metric-card p-2 bg-light rounded">
-                                <div class="h5 mb-0 text-info">${Math.round(metrics.wordCount / Math.max(metrics.readingTime, 1))}</div>
-                                <small class="text-muted">WPM</small>
-                            </div>
-                        </div>
-                    </div>
-                    <small class="text-muted">${wordCountCategory.description}</small>
-                </div>
-            </div>
-        `;
     }
 
     // Render detected actions
@@ -1687,6 +1708,273 @@ class KnowledgePanel {
         } catch (error) {
             console.warn("Could not save extraction settings:", error);
         }
+    }
+
+    // ===================================================================
+    // STREAMING KNOWLEDGE EXTRACTION METHODS
+    // ===================================================================
+
+    private setupStreamingListeners() {
+        chrome.runtime.onMessage.addListener(
+            (message, sender, sendResponse) => {
+                if (message.type === "knowledgeExtractionProgress") {
+                    this.updateExtractionProgress(message.progress);
+                } else if (message.type === "knowledgeExtractionComplete") {
+                    this.handleExtractionComplete(message);
+                }
+            },
+        );
+    }
+
+    public updateExtractionProgress(
+        progress: KnowledgeExtractionProgress,
+    ): void {
+        if (
+            !this.streamingState ||
+            this.currentExtractionId !== progress.extractionId
+        ) {
+            return;
+        }
+
+        // Update progress elements similar to websiteImportUI
+        const progressBar = document.querySelector(
+            "#knowledgeProgressBar",
+        ) as HTMLElement;
+        const statusElement = document.querySelector("#knowledgeStatusMessage");
+        const progressText = document.querySelector("#knowledgeProgressText");
+
+        // Update status message with phase-based messages (like import phases)
+        if (statusElement) {
+            const phaseMessages: Record<string, string> = {
+                content: "Retrieving page content...",
+                basic: "Analyzing basic information...",
+                summary: "Generating summary...",
+                analyzing: "Analyzing entities and topics...",
+                extracting: "Extracting relationships...",
+                complete: "Knowledge extraction complete!",
+                error: "Extraction failed",
+            };
+
+            let newMessage = phaseMessages[progress.phase] || progress.phase;
+
+            // Use currentItem for specific details (like import UI)
+            if (progress.currentItem) {
+                const truncatedItem =
+                    progress.currentItem.length > 50
+                        ? progress.currentItem.substring(0, 50) + "..."
+                        : progress.currentItem;
+                // newMessage += ` (${truncatedItem})`;
+            }
+
+            // Animate status updates like import UI
+            statusElement.classList.add("status-updating");
+            statusElement.textContent = newMessage;
+
+            setTimeout(() => {
+                statusElement.classList.remove("status-updating");
+            }, 200);
+        }
+
+        // Update progress bar with smooth animation (like import UI)
+        if (progressBar && progress.totalItems > 0) {
+            const percentage = Math.round(
+                (progress.processedItems / progress.totalItems) * 100,
+            );
+
+            progressBar.style.transition = "width 0.3s ease-in-out";
+            progressBar.style.width = `${Math.max(0, Math.min(100, percentage))}%`;
+            progressBar.setAttribute("aria-valuenow", percentage.toString());
+
+            // Add pulse effect for active phases
+            if (
+                progress.phase === "analyzing" ||
+                progress.phase === "extracting"
+            ) {
+                progressBar.classList.add("progress-pulse");
+            } else {
+                progressBar.classList.remove("progress-pulse");
+            }
+        }
+
+        // Update progress text
+        if (progressText && progress.totalItems > 0) {
+            progressText.textContent = `${progress.processedItems} of ${progress.totalItems} items processed`;
+        }
+
+        // Update display with latest aggregated knowledge data
+        if (progress.incrementalData) {
+            const newData = this.updateKnowledgeData(
+                this.streamingState.currentData,
+                progress.incrementalData,
+            );
+
+            // Update UI with latest aggregated results
+            this.updateKnowledgeDisplay(
+                this.streamingState.currentData,
+                newData,
+            );
+
+            this.streamingState.currentData = newData;
+        }
+
+        // Handle completion
+        if (progress.phase === "complete") {
+            // Store the final extracted data for saving
+            if (this.streamingState && this.streamingState.currentData) {
+                this.extractedKnowledgeData = this.streamingState.currentData;
+                this.knowledgeData = this.streamingState.currentData;
+            }
+            this.completeStreaming();
+        } else if (progress.phase === "error") {
+            this.handleExtractionError(progress.errors);
+        }
+    }
+
+    private updateKnowledgeData(
+        existing: KnowledgeData,
+        incoming: Partial<any>, // Using any to avoid type conflicts with incremental data
+    ): KnowledgeData {
+        const merged = { ...existing };
+
+        // Replace entities entirely with latest aggregated results
+        // Incoming data now contains fully aggregated results, not incremental updates
+        if (incoming.entities) {
+            merged.entities = incoming.entities;
+        }
+
+        // Replace relationships entirely with latest aggregated results
+        if (incoming.relationships) {
+            merged.relationships = incoming.relationships;
+        }
+
+        // Replace topics entirely with latest aggregated results
+        if (incoming.keyTopics) {
+            merged.keyTopics = incoming.keyTopics;
+        }
+
+        // Update summary (replace, not merge)
+        if (incoming.summary) {
+            merged.summary = incoming.summary;
+        }
+
+        // Update other fields
+        if (incoming.contentActions) {
+            merged.contentActions = incoming.contentActions;
+        }
+        if (incoming.detectedActions) {
+            merged.detectedActions = incoming.detectedActions;
+        }
+        if (incoming.actionSummary) {
+            merged.actionSummary = incoming.actionSummary;
+        }
+        if (incoming.contentMetrics) {
+            merged.contentMetrics = incoming.contentMetrics;
+        }
+
+        return merged;
+    }
+
+    private updateKnowledgeDisplay(
+        oldData: KnowledgeData,
+        newData: KnowledgeData,
+    ): void {
+        // For now, just re-render the entire knowledge data
+        // TODO: Implement proper incremental animation updates
+        this.renderKnowledgeResults(newData);
+    }
+
+    private completeStreaming(): void {
+        this.streamingState = null;
+        this.currentExtractionId = null;
+
+        // Hide progress indicators
+        const progressContainer = document.querySelector("#extractionProgress");
+        if (progressContainer) {
+            progressContainer.classList.add("d-none");
+        }
+
+        // Enable save button if we have knowledge data
+        if (this.extractedKnowledgeData) {
+            this.enableSaveButton();
+        }
+    }
+
+    private handleExtractionError(errors: any[]): void {
+        console.error("Knowledge extraction errors:", errors);
+        this.streamingState = null;
+        this.currentExtractionId = null;
+
+        // Hide progress indicators
+        const progressContainer = document.querySelector("#extractionProgress");
+        if (progressContainer) {
+            progressContainer.classList.add("d-none");
+        }
+
+        // Show error notification
+        const errorMessage =
+            errors.length > 0 ? errors[0].message : "Unknown error occurred";
+        notificationManager.showError("Extraction Failed", errorMessage);
+    }
+
+    private handleExtractionComplete(message: any): void {
+        if (message.extractionId === this.currentExtractionId) {
+            this.extractedKnowledgeData = message.finalData;
+            this.knowledgeData = message.finalData;
+
+            if (this.knowledgeData) {
+                this.renderKnowledgeResults(this.knowledgeData);
+            }
+
+            this.completeStreaming();
+        }
+    }
+
+    private showStreamingProgress(): void {
+        // Show progress indicator
+        const progressContainer = document.querySelector("#extractionProgress");
+        if (progressContainer) {
+            progressContainer.classList.remove("d-none");
+        }
+
+        // Reset progress elements
+        const progressBar = document.querySelector(
+            "#knowledgeProgressBar",
+        ) as HTMLElement;
+        const statusElement = document.querySelector("#knowledgeStatusMessage");
+        const progressText = document.querySelector("#knowledgeProgressText");
+
+        if (progressBar) {
+            progressBar.style.width = "0%";
+            progressBar.setAttribute("aria-valuenow", "0");
+        }
+
+        if (statusElement) {
+            statusElement.textContent = "Initializing extraction...";
+        }
+
+        if (progressText) {
+            progressText.textContent = "0 of 0 items processed";
+        }
+
+        // Hide regular knowledge loading state
+        this.hideKnowledgeLoading();
+    }
+
+    private hideKnowledgeLoading(): void {
+        const knowledgeSection = document.getElementById("knowledgeSection");
+        if (knowledgeSection) {
+            knowledgeSection.classList.add("d-none");
+        }
+    }
+
+    private hideStreamingProgress(): void {
+        const progressContainer = document.querySelector("#extractionProgress");
+        if (progressContainer) {
+            progressContainer.classList.add("d-none");
+        }
+        // Reset streaming state
+        this.streamingState = null;
+        this.currentExtractionId = null;
     }
 }
 

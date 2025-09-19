@@ -12,6 +12,11 @@ import type {
     ImportResult,
     ProgressCallback,
 } from "../interfaces/websiteImport.types";
+import type {
+    KnowledgeExtractionProgress,
+    KnowledgeProgressCallback,
+    KnowledgeExtractionResult,
+} from "../interfaces/knowledgeExtraction.types";
 
 // ===================================================================
 // INTERFACE DEFINITIONS
@@ -210,12 +215,22 @@ export abstract class ExtensionServiceBase {
         });
     }
 
-    async indexPageContent(url: string, mode: string): Promise<any> {
-        return this.sendMessage({
+    async indexPageContent(
+        url: string,
+        mode: string,
+        extractedKnowledge?: any,
+    ): Promise<any> {
+        const message: any = {
             type: "indexPageContentDirect",
             url,
             mode,
-        });
+        };
+
+        if (extractedKnowledge) {
+            message.extractedKnowledge = extractedKnowledge;
+        }
+
+        return this.sendMessage(message);
     }
 
     async extractPageKnowledge(
@@ -229,6 +244,37 @@ export abstract class ExtensionServiceBase {
             mode,
             extractionSettings,
         });
+    }
+
+    async extractPageKnowledgeStreaming(
+        url: string,
+        mode: string,
+        extractionSettings: any,
+        streamingEnabled: boolean = true,
+        extractionId: string,
+    ): Promise<any> {
+        try {
+            const response = await this.sendMessage({
+                type: "extractPageKnowledgeStreaming",
+                url,
+                mode,
+                extractionSettings,
+                streamingEnabled,
+                extractionId,
+            });
+
+            if (!response) {
+                return { extractionId, success: false };
+            }
+
+            return response;
+        } catch (error) {
+            return {
+                extractionId,
+                success: false,
+                error: (error as Error).message || String(error),
+            };
+        }
     }
 
     async queryKnowledge(parameters: any): Promise<any> {
@@ -340,6 +386,62 @@ export abstract class ExtensionServiceBase {
         return this.sendMessage({
             type: "getPageQualityMetrics",
             url,
+        });
+    }
+
+    async getKnowledgeGraphStatus(): Promise<any> {
+        return this.sendMessage({
+            type: "getKnowledgeGraphStatus",
+        });
+    }
+
+    async buildKnowledgeGraph(options?: {
+        minimalMode?: boolean;
+        urlLimit?: number;
+    }): Promise<any> {
+        return this.sendMessage({
+            type: "buildKnowledgeGraph",
+            parameters: options || {},
+        });
+    }
+
+    async rebuildKnowledgeGraph(): Promise<any> {
+        return this.sendMessage({
+            type: "rebuildKnowledgeGraph",
+        });
+    }
+
+    async getAllRelationships(): Promise<any[]> {
+        const result = await this.sendMessage<{ relationships?: any[] }>({
+            type: "getAllRelationships",
+        });
+        return result?.relationships || [];
+    }
+
+    async getAllCommunities(): Promise<any[]> {
+        const result = await this.sendMessage<{ communities?: any[] }>({
+            type: "getAllCommunities",
+        });
+        return result?.communities || [];
+    }
+
+    async getAllEntitiesWithMetrics(): Promise<any[]> {
+        const result = await this.sendMessage<{ entities?: any[] }>({
+            type: "getAllEntitiesWithMetrics",
+        });
+        return result?.entities || [];
+    }
+
+    async getEntityNeighborhood(
+        entityId: string,
+        depth: number,
+        maxNodes: number,
+    ): Promise<any> {
+        return this.sendMessage({
+            type: "getEntityNeighborhood",
+            entityId: entityId,
+            depth: depth,
+            maxNodes: maxNodes,
         });
     }
 
@@ -457,6 +559,13 @@ export abstract class ExtensionServiceBase {
         this.onImportProgressImpl(importId, callback);
     }
 
+    onExtractionProgress(
+        extractionId: string,
+        callback: KnowledgeProgressCallback,
+    ): void {
+        this.onExtractionProgressImpl(extractionId, callback);
+    }
+
     // Macro methods
     async getMacrosForUrl(
         url: string,
@@ -517,6 +626,15 @@ export abstract class ExtensionServiceBase {
     protected abstract onImportProgressImpl(
         importId: string,
         callback: ProgressCallback,
+    ): void;
+
+    /**
+     * Environment-specific knowledge extraction progress tracking
+     * Concrete classes must implement this method
+     */
+    protected abstract onExtractionProgressImpl(
+        extractionId: string,
+        callback: KnowledgeProgressCallback,
     ): void;
 
     // ===================================================================

@@ -734,16 +734,19 @@ export function createChatModelDefault(tag: string): ChatModelWithStreaming {
  * Uses the type: json_object flag
  * @param endpoint
  * @param tags - Tags for tracking this model's usage
+ * @param completionSettings Completion settings for the model
  * @returns ChatModel
  */
 export function createJsonChatModel(
     endpoint?: string | ApiSettings,
     tags?: string[],
+    completionSettings?: CompletionSettings,
 ): ChatModelWithStreaming {
     return createChatModel(
         endpoint,
         {
             response_format: { type: "json_object" },
+            ...completionSettings,
         },
         undefined,
         tags,
@@ -778,7 +781,16 @@ export type AzureChatModelName =
     | "GPT_4"
     | "GPT_35_TURBO"
     | "GPT_4_O"
-    | "GPT_4_O_MINI";
+    | "GPT_4_O_MINI"
+    | "GPT_5"
+    | "GPT_5_MINI"
+    | "GPT_5_NANO"
+    | "GPT_5_CHAT";
+
+export const GPT_5: AzureChatModelName = "GPT_5";
+export const GPT_5_NANO: AzureChatModelName = "GPT_5_NANO";
+export const GPT_5_MINI: AzureChatModelName = "GPT_5_MINI";
+export const GPT_5_CHAT: AzureChatModelName = "GPT_5_CHAT";
 
 /**
  * Create a client for the OpenAI embeddings service

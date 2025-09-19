@@ -232,6 +232,7 @@ dotnet_diagnostic.IDE0002.severity = none # Simplify member access
 dotnet_diagnostic.IDE0004.severity = none # Remove unnecessary cast
 dotnet_diagnostic.IDE0005.severity = none # Remove unnecessary cast
 dotnet_diagnostic.IDE0009.severity = none # Add this or Me qualification
+dotnet_diagnostic.IDE0010.severity = none # Populate switch
 dotnet_diagnostic.IDE0017.severity = none # Object initializers
 dotnet_diagnostic.IDE0022.severity = none # Use block body for method
 dotnet_diagnostic.IDE0032.severity = none # Use auto property
@@ -251,6 +252,8 @@ dotnet_diagnostic.IDE0100.severity = none # Remove unnecessary equality operator
 dotnet_diagnostic.IDE0110.severity = none # Remove unnecessary discards
 dotnet_diagnostic.IDE00130.severity = none # 
 dotnet_diagnostic.IDE0160.severity = none # Use block-scoped namespace
+
+dotnet_diagnostic.IDE0290.severity = none
 
 ###############################
 # Naming Conventions          #

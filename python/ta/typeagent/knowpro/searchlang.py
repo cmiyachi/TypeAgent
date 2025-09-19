@@ -1,10 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+from collections.abc import Callable
 import copy
 from dataclasses import dataclass, replace
 import datetime
-from typing import Callable, Literal, TypeGuard, cast
+from typing import Literal, TypeGuard, cast
 
 import typechat
 
@@ -24,7 +25,7 @@ from ..knowpro.interfaces import (
     Term,
     WhenFilter,
 )
-from ..knowpro.propindex import PropertyNames
+from ..storage.memory.propindex import PropertyNames
 from ..knowpro.search import (
     ConversationSearchResult,
     SearchOptions,
@@ -33,6 +34,7 @@ from ..knowpro.search import (
     has_conversation_results,
     run_search_query,
 )
+from ..knowpro.searchlib import create_property_search_term
 
 from .date_time_schema import DateTime, DateTimeRange
 from .search_query_schema import (
@@ -480,8 +482,6 @@ class SearchQueryCompiler:
     def compile_subject_and_verb(self, action_term: ActionTerm) -> SearchTermGroup:
         term_group = SearchTermGroup("and")
         self.add_subject_to_group(action_term, term_group)
-        term_group = SearchTermGroup("and")
-        self.add_subject_to_group(action_term, term_group)
         if action_term.action_verbs is not None:
             self.add_verbs_to_group(action_term.action_verbs, term_group)
         return term_group
@@ -708,22 +708,6 @@ def datetime_from_date_time(date_time: DateTime) -> Datetime:
         tzinfo=datetime.timezone.utc,
     )
     return dt
-
-
-def create_property_search_term(
-    name: str,
-    value: str,
-    exact_match_value: bool = False,
-) -> PropertySearchTerm:
-    property_name: KnowledgePropertyName | SearchTerm
-    if name in KnowledgePropertyName.__value__.__args__:
-        property_name = cast(KnowledgePropertyName, name)
-    else:
-        property_name = SearchTerm(Term(name))
-    property_value = SearchTerm(Term(value))
-    if exact_match_value:
-        property_value.related_terms = []
-    return PropertySearchTerm(property_name, property_value)
 
 
 # TODO: Move to searchquerytranslator.py?

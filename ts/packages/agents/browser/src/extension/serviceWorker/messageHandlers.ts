@@ -10,6 +10,31 @@ import {
     getWebSocket,
 } from "./websocket";
 import { BrowserContentDownloader } from "./contentDownloader.js";
+import type { KnowledgeExtractionProgress } from "../interfaces/knowledgeExtraction.types";
+
+// Store active extraction callbacks
+const knowledgeExtractionCallbacks = new Map<
+    string,
+    (progress: KnowledgeExtractionProgress) => void
+>();
+
+/**
+ * Handle knowledge extraction progress updates from WebSocket
+ */
+export function handleKnowledgeExtractionProgress(
+    extractionId: string,
+    progress: KnowledgeExtractionProgress,
+) {
+    const callback = knowledgeExtractionCallbacks.get(extractionId);
+    if (typeof callback === "function") {
+        callback(progress);
+
+        // Cleanup on completion
+        if (progress.phase === "complete" || progress.phase === "error") {
+            knowledgeExtractionCallbacks.delete(extractionId);
+        }
+    }
+}
 
 /**
  * Handles messages from content scripts
@@ -303,7 +328,114 @@ export async function handleMessage(
                     return { error: "Failed to extract knowledge from page" };
                 }
             }
-            return { error: "No active tab found" };
+            return {
+                error: "No browser tabs are currently open. Please open a browser tab to continue.",
+            };
+        }
+
+        case "extractPageKnowledgeStreaming": {
+            const targetTab = await getActiveTab();
+            if (targetTab && message.streamingEnabled) {
+                const extractionId = message.extractionId;
+
+                const progressCallback = (
+                    progress: KnowledgeExtractionProgress,
+                ) => {
+                    try {
+                        chrome.runtime.sendMessage({
+                            type: "knowledgeExtractionProgress",
+                            extractionId,
+                            progress: progress,
+                        });
+                        /*
+                            .catch((error) => {
+                                // Handle case where no listeners are available
+                                console.log("No listeners for progress update:", error);
+                            })*/
+                    } catch (error) {
+                        console.error("Failed to send progress to UI:", error);
+                    }
+                };
+
+                // Register progress handler
+                knowledgeExtractionCallbacks.set(
+                    extractionId,
+                    progressCallback,
+                );
+
+                try {
+                    const htmlFragments = await getTabHTMLFragments(
+                        targetTab,
+                        false,
+                        false,
+                        true,
+                        false, // useTimestampIds
+                        true, // filterToReadingView - use reading view for knowledge extraction
+                        true, // keepMetaTags - preserve metadata for context
+                    );
+
+                    // Start extraction with streaming flag
+                    const knowledgeResult = await sendActionToAgent({
+                        actionName: "extractKnowledgeFromPageStreaming",
+                        parameters: {
+                            url: targetTab.url,
+                            title: targetTab.title,
+                            mode: message.mode || "content",
+                            extractionId: extractionId,
+                            htmlFragments: htmlFragments,
+                            extractionSettings: message.extractionSettings,
+                        },
+                    });
+
+                    return {
+                        success: true,
+                        extractionId: extractionId,
+                        finalData: knowledgeResult,
+                    };
+                } catch (error) {
+                    console.error(
+                        "Error in streaming knowledge extraction:",
+                        error,
+                    );
+
+                    // Send error progress update
+                    const errorProgress: KnowledgeExtractionProgress = {
+                        extractionId,
+                        phase: "error",
+                        totalItems: 1,
+                        processedItems: 0,
+                        errors: [
+                            {
+                                message:
+                                    (error as Error).message || String(error),
+                                timestamp: Date.now(),
+                            },
+                        ],
+                    };
+
+                    const callback =
+                        knowledgeExtractionCallbacks.get(extractionId);
+                    if (callback) {
+                        callback(errorProgress);
+                        knowledgeExtractionCallbacks.delete(extractionId);
+                    }
+
+                    return {
+                        error: "Failed to extract knowledge from page",
+                        extractionId: extractionId,
+                        success: false,
+                    };
+                }
+            } else {
+                // Return error if streaming was requested but cannot be performed
+                return {
+                    error: targetTab
+                        ? "Streaming mode is disabled"
+                        : "No browser tabs are currently open",
+                    extractionId: message.extractionId,
+                    success: false,
+                };
+            }
         }
 
         case "queryKnowledge": {
@@ -402,11 +534,15 @@ export async function handleMessage(
                     message.showNotification !== false,
                     {
                         mode: message.mode,
+                        extractedKnowledge: message.extractedKnowledge,
                     },
                 );
                 return { success };
             }
-            return { success: false, error: "No active tab found" };
+            return {
+                success: false,
+                error: "No browser tabs are currently open. Please open a browser tab to continue.",
+            };
         }
 
         case "autoIndexPage": {
@@ -793,6 +929,137 @@ export async function handleMessage(
                             ? error.message
                             : "Unknown error",
                 };
+            }
+        }
+
+        case "getKnowledgeGraphStatus": {
+            try {
+                const result = await sendActionToAgent({
+                    actionName: "getKnowledgeGraphStatus",
+                    parameters: {},
+                });
+
+                return {
+                    hasGraph: result.hasGraph || false,
+                    entityCount: result.entityCount || 0,
+                    relationshipCount: result.relationshipCount || 0,
+                    communityCount: result.communityCount || 0,
+                    isBuilding: result.isBuilding || false,
+                    error: result.error || null,
+                };
+            } catch (error) {
+                console.error("Error getting knowledge graph status:", error);
+                return {
+                    hasGraph: false,
+                    entityCount: 0,
+                    relationshipCount: 0,
+                    communityCount: 0,
+                    isBuilding: false,
+                    error: "Failed to get graph status",
+                };
+            }
+        }
+
+        case "buildKnowledgeGraph": {
+            try {
+                const result = await sendActionToAgent({
+                    actionName: "buildKnowledgeGraph",
+                    parameters: message.parameters || {},
+                });
+
+                return {
+                    success: result.success || false,
+                    message: result.message || "Graph building started",
+                };
+            } catch (error) {
+                console.error("Error building knowledge graph:", error);
+                return {
+                    success: false,
+                    error: "Failed to build knowledge graph",
+                };
+            }
+        }
+
+        case "rebuildKnowledgeGraph": {
+            try {
+                const result = await sendActionToAgent({
+                    actionName: "rebuildKnowledgeGraph",
+                    parameters: {},
+                });
+
+                return {
+                    success: result.success || false,
+                    message: result.message || "Graph rebuilding started",
+                };
+            } catch (error) {
+                console.error("Error rebuilding knowledge graph:", error);
+                return {
+                    success: false,
+                    error: "Failed to rebuild knowledge graph",
+                };
+            }
+        }
+
+        case "getAllRelationships": {
+            try {
+                const result = await sendActionToAgent({
+                    actionName: "getAllRelationships",
+                    parameters: {},
+                });
+
+                return result;
+            } catch (error) {
+                console.error("Error getting all relationships:", error);
+                return [];
+            }
+        }
+
+        case "getAllCommunities": {
+            try {
+                const result = await sendActionToAgent({
+                    actionName: "getAllCommunities",
+                    parameters: {},
+                });
+
+                return result;
+            } catch (error) {
+                console.error("Error getting all communities:", error);
+                return [];
+            }
+        }
+
+        case "getAllEntitiesWithMetrics": {
+            try {
+                const result = await sendActionToAgent({
+                    actionName: "getAllEntitiesWithMetrics",
+                    parameters: {},
+                });
+
+                return result;
+            } catch (error) {
+                console.error(
+                    "Error getting all entities with metrics:",
+                    error,
+                );
+                return [];
+            }
+        }
+
+        case "getEntityNeighborhood": {
+            try {
+                const result = await sendActionToAgent({
+                    actionName: "getEntityNeighborhood",
+                    parameters: {
+                        entityId: message.entityId,
+                        depth: message.depth,
+                        maxNodes: message.maxNodes,
+                    },
+                });
+
+                return result;
+            } catch (error) {
+                console.error("Error getting entity neighborhood:", error);
+                return [];
             }
         }
 
@@ -1190,31 +1457,46 @@ async function indexPageContent(
         quality?: "fast" | "balanced" | "deep";
         textOnly?: boolean;
         mode?: "basic" | "content" | "actions" | "full";
+        extractedKnowledge?: any;
     } = {},
 ): Promise<boolean> {
     try {
-        const htmlFragments = await getTabHTMLFragments(
-            tab,
-            false,
-            false,
-            true, // extract text
-            false, // useTimestampIds
-            true, // filterToReadingView - use reading view for indexing
-            true, // keepMetaTags - preserve metadata for indexing context
-        );
+        let htmlFragments = null;
+        let extractKnowledge = true;
+
+        if (options.extractedKnowledge) {
+            extractKnowledge = false;
+        } else {
+            htmlFragments = await getTabHTMLFragments(
+                tab,
+                false,
+                false,
+                true, // extract text
+                false, // useTimestampIds
+                true, // filterToReadingView - use reading view for indexing
+                true, // keepMetaTags - preserve metadata for indexing context
+            );
+        }
+
+        const parameters: any = {
+            url: tab.url,
+            title: tab.title,
+            extractKnowledge: extractKnowledge,
+            timestamp: new Date().toISOString(),
+            quality: options.quality || "balanced",
+            textOnly: options.textOnly || false,
+            mode: options.mode || "content",
+        };
+
+        if (options.extractedKnowledge) {
+            parameters.extractedKnowledge = options.extractedKnowledge;
+        } else {
+            parameters.htmlFragments = htmlFragments;
+        }
 
         await sendActionToAgent({
             actionName: "indexWebPageContent",
-            parameters: {
-                url: tab.url,
-                title: tab.title,
-                htmlFragments: htmlFragments,
-                extractKnowledge: true,
-                timestamp: new Date().toISOString(),
-                quality: options.quality || "balanced",
-                textOnly: options.textOnly || false,
-                mode: options.mode || "content",
-            },
+            parameters: parameters,
         });
 
         if (showNotification) {
@@ -1436,9 +1718,16 @@ async function handleDownloadContentWithBrowser(message: any): Promise<any> {
     try {
         const downloader = getContentDownloader();
 
+        // Clamp timeout to safe range (min 1000 ms, max 10000 ms)
+        const requestedTimeout = Number(message.options?.timeout);
+        const safeTimeout =
+            Number.isFinite(requestedTimeout) && requestedTimeout >= 1000
+                ? Math.min(requestedTimeout, 10000)
+                : 3000; // fallback to 3 seconds if invalid
+
         const result = await downloader.downloadContent(message.url, {
             useAuthentication: message.options?.useAuthentication ?? true,
-            timeout: message.options?.timeout ?? 30000,
+            timeout: safeTimeout,
             fallbackToFetch: message.options?.fallbackToFetch ?? true,
             waitForDynamic: message.options?.waitForDynamic ?? false,
             scrollBehavior:

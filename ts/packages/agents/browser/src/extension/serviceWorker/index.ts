@@ -81,6 +81,15 @@ function setupEventListeners(): void {
     chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
         if (changeInfo.status === "complete" && tab.active) {
             await toggleSiteTranslator(tab);
+
+            // Trigger navigation handler for page knowledge extraction
+            if (tab.url && tab.title) {
+                try {
+                    await sendNavigationMessage(tab.url, tab.title, tab.id);
+                } catch (error) {
+                    console.error("Error sending navigation message:", error);
+                }
+            }
         }
         if (changeInfo.title) {
             const addTabAction = {
@@ -364,5 +373,55 @@ async function sendActionToTabIndex(action: any): Promise<string | undefined> {
 // Start initialization
 initialize();
 
+// Track recent navigation events for debouncing
+const recentNavigations = new Map<string, number>();
+
 // Re-export functions that need to be accessible from other modules
-export { sendActionToTabIndex };
+async function sendNavigationMessage(
+    url: string,
+    title: string,
+    tabId?: number,
+): Promise<void> {
+    const webSocket = getWebSocket();
+    if (!webSocket) {
+        return;
+    }
+
+    try {
+        // Debounce rapid navigation events
+        const navigationKey = `${tabId}-${url}`;
+        if (recentNavigations.has(navigationKey)) {
+            const lastNav = recentNavigations.get(navigationKey);
+            if (lastNav && Date.now() - lastNav < 2000) {
+                // 2 second debounce
+                console.log(`Debouncing navigation to ${url}`);
+                return;
+            }
+        }
+        recentNavigations.set(navigationKey, Date.now());
+
+        // Clean up old entries periodically
+        if (recentNavigations.size > 100) {
+            const cutoff = Date.now() - 60000; // 1 minute
+            for (const [key, time] of recentNavigations.entries()) {
+                if (time < cutoff) {
+                    recentNavigations.delete(key);
+                }
+            }
+        }
+        webSocket.send(
+            JSON.stringify({
+                method: "handlePageNavigation",
+                params: {
+                    url,
+                    title,
+                    tabId,
+                },
+            }),
+        );
+    } catch (error) {
+        console.error("Error sending navigation message:", error);
+    }
+}
+
+export { sendActionToTabIndex, sendNavigationMessage };

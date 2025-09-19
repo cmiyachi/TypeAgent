@@ -48,7 +48,6 @@ interface LibraryStats {
 
 interface UserPreferences {
     viewMode: string;
-    autoExtractKnowledge: boolean;
     showConfidenceScores: boolean;
     enableNotifications: boolean;
     theme: "light" | "dark" | "auto";
@@ -153,6 +152,9 @@ class WebsiteLibraryPanelFullPage {
             "importWebActivityBtn",
         );
         const importFromFileBtn = document.getElementById("importFromFileBtn");
+        const buildKnowledgeGraphBtn = document.getElementById(
+            "buildKnowledgeGraphBtn",
+        );
 
         if (importWebActivityBtn) {
             importWebActivityBtn.addEventListener("click", () => {
@@ -163,6 +165,12 @@ class WebsiteLibraryPanelFullPage {
         if (importFromFileBtn) {
             importFromFileBtn.addEventListener("click", () => {
                 this.showFolderImportModal();
+            });
+        }
+
+        if (buildKnowledgeGraphBtn) {
+            buildKnowledgeGraphBtn.addEventListener("click", () => {
+                this.showKnowledgeGraphModal();
             });
         }
 
@@ -227,18 +235,16 @@ class WebsiteLibraryPanelFullPage {
     private updateConnectionStatus() {
         const statusElement = document.getElementById("connectionStatus");
         if (statusElement) {
-            const indicator = statusElement.querySelector(".status-indicator");
-            const text = statusElement.querySelector("span:last-child");
-
-            if (indicator && text) {
-                if (this.isConnected) {
-                    indicator.className = "status-indicator status-connected";
-                    text.textContent = "Connected";
-                } else {
-                    indicator.className =
-                        "status-indicator status-disconnected";
-                    text.textContent = "Disconnected";
-                }
+            if (this.isConnected) {
+                // Hide connection status when connected
+                statusElement.style.display = "none";
+            } else {
+                // Show disconnection warning
+                statusElement.style.display = "flex";
+                statusElement.innerHTML = `
+                    <span class="status-indicator status-disconnected"></span>
+                    <span class="text-warning">Disconnected</span>
+                `;
             }
         }
     }
@@ -399,8 +405,8 @@ class WebsiteLibraryPanelFullPage {
     private setupEventListeners() {
         const settingsButton = document.getElementById("settingsButton");
         if (settingsButton) {
-            settingsButton.addEventListener("click", () => {
-                this.showSettings();
+            settingsButton.addEventListener("click", async () => {
+                await this.showSettings();
             });
         }
 
@@ -560,12 +566,12 @@ class WebsiteLibraryPanelFullPage {
         );
     }
 
-    public showSettings() {
-        this.createEnhancedSettingsModal();
+    public async showSettings() {
+        await this.createEnhancedSettingsModal();
     }
 
     // Settings management
-    private createEnhancedSettingsModal() {
+    private async createEnhancedSettingsModal() {
         const existingModal = document.getElementById("settingsModal");
         if (existingModal) {
             existingModal.remove();
@@ -627,11 +633,14 @@ class WebsiteLibraryPanelFullPage {
 
         document.body.insertAdjacentHTML("beforeend", modalHtml);
 
-        this.populateSettingsModal();
+        await this.populateSettingsModal();
 
         const saveBtn = document.getElementById("saveSettingsBtn");
         if (saveBtn) {
-            saveBtn.addEventListener("click", () => this.saveUserPreferences());
+            saveBtn.addEventListener(
+                "click",
+                async () => await this.saveUserPreferences(),
+            );
         }
 
         const modal = document.getElementById("settingsModal");
@@ -641,7 +650,7 @@ class WebsiteLibraryPanelFullPage {
         }
     }
 
-    private populateSettingsModal() {
+    private async populateSettingsModal() {
         const prefs = this.userPreferences;
 
         const defaultViewMode = document.getElementById(
@@ -658,15 +667,35 @@ class WebsiteLibraryPanelFullPage {
         ) as HTMLInputElement;
 
         if (defaultViewMode) defaultViewMode.value = prefs.viewMode;
-        if (autoExtractKnowledge)
-            autoExtractKnowledge.checked = prefs.autoExtractKnowledge;
+        if (autoExtractKnowledge) {
+            autoExtractKnowledge.checked = await this.loadAutoIndexSetting();
+        }
         if (showConfidenceScores)
             showConfidenceScores.checked = prefs.showConfidenceScores;
         if (enableNotifications)
             enableNotifications.checked = prefs.enableNotifications;
     }
 
-    private saveUserPreferences() {
+    // Auto-indexing setting helpers using ExtensionService
+    private async loadAutoIndexSetting(): Promise<boolean> {
+        try {
+            return await extensionService.getAutoIndexSetting();
+        } catch (error) {
+            console.error("Failed to load auto-index setting:", error);
+            return false;
+        }
+    }
+
+    private async saveAutoIndexSetting(enabled: boolean): Promise<void> {
+        try {
+            await extensionService.setAutoIndexSetting(enabled);
+        } catch (error) {
+            console.error("Failed to save auto-index setting:", error);
+            throw error;
+        }
+    }
+
+    private async saveUserPreferences() {
         const defaultViewMode = document.getElementById(
             "defaultViewMode",
         ) as HTMLSelectElement;
@@ -680,9 +709,22 @@ class WebsiteLibraryPanelFullPage {
             "enableNotifications",
         ) as HTMLInputElement;
 
+        // Handle auto-indexing separately via ExtensionService
+        if (autoExtractKnowledge) {
+            try {
+                await this.saveAutoIndexSetting(autoExtractKnowledge.checked);
+            } catch (error) {
+                console.error("Failed to save auto-index setting:", error);
+                notificationManager.showError(
+                    "Failed to save auto-indexing setting",
+                );
+                return;
+            }
+        }
+
+        // Save other preferences to localStorage
         this.userPreferences = {
             viewMode: defaultViewMode?.value || "list",
-            autoExtractKnowledge: autoExtractKnowledge?.checked || false,
             showConfidenceScores: showConfidenceScores?.checked || true,
             enableNotifications: enableNotifications?.checked || true,
             theme: this.userPreferences.theme,
@@ -728,7 +770,6 @@ class WebsiteLibraryPanelFullPage {
 
         return {
             viewMode: "list",
-            autoExtractKnowledge: false,
             showConfidenceScores: true,
             enableNotifications: true,
             theme: "light",
@@ -754,6 +795,276 @@ class WebsiteLibraryPanelFullPage {
 
     public showFolderImportModal() {
         this.importUI.showFolderImportModal();
+    }
+
+    public async showKnowledgeGraphModal() {
+        const modal = document.getElementById("knowledgeGraphModal");
+        if (modal) {
+            // Show the modal
+            const bootstrapModal = new (window as any).bootstrap.Modal(modal);
+            bootstrapModal.show();
+
+            // Load graph status
+            await this.loadGraphStatus();
+
+            // Setup modal event listeners
+            this.setupKnowledgeGraphModalEventListeners();
+        }
+    }
+
+    private async loadGraphStatus() {
+        try {
+            // Get graph status from backend
+            const response = await extensionService.getKnowledgeGraphStatus();
+
+            // Handle null or undefined response
+            if (!response) {
+                this.updateGraphStatusDisplay({
+                    hasGraph: false,
+                    entityCount: 0,
+                    relationshipCount: 0,
+                    communityCount: 0,
+                    isBuilding: false,
+                    error: "No graph status available",
+                });
+                return;
+            }
+
+            this.updateGraphStatusDisplay(response);
+        } catch (error) {
+            console.error("Failed to load graph status:", error);
+            this.updateGraphStatusDisplay({
+                hasGraph: false,
+                entityCount: 0,
+                relationshipCount: 0,
+                communityCount: 0,
+                isBuilding: false,
+                error: "Failed to check graph status",
+            });
+        }
+    }
+
+    private updateGraphStatusDisplay(status: any) {
+        const graphStateIcon = document.getElementById("graphStateIcon");
+        const graphStateText = document.getElementById("graphStateText");
+        const graphStateDescription = document.getElementById(
+            "graphStateDescription",
+        );
+        const graphMetrics = document.getElementById("graphMetrics");
+        const buildProgress = document.getElementById("buildProgress");
+        const viewEntityGraphBtn =
+            document.getElementById("viewEntityGraphBtn");
+        const rebuildGraphBtn = document.getElementById("rebuildGraphBtn");
+        const buildGraphBtn = document.getElementById("buildGraphBtn");
+
+        if (!graphStateIcon || !graphStateText || !graphStateDescription)
+            return;
+
+        // Ensure status object has required properties with defaults
+        const safeStatus = {
+            hasGraph: status?.hasGraph || false,
+            entityCount: status?.entityCount || 0,
+            relationshipCount: status?.relationshipCount || 0,
+            communityCount: status?.communityCount || 0,
+            isBuilding: status?.isBuilding || false,
+            error: status?.error || null,
+        };
+
+        // Hide all sections initially
+        if (graphMetrics) graphMetrics.style.display = "none";
+        if (buildProgress) buildProgress.style.display = "none";
+        if (viewEntityGraphBtn) viewEntityGraphBtn.style.display = "none";
+        if (rebuildGraphBtn) rebuildGraphBtn.style.display = "none";
+        if (buildGraphBtn) buildGraphBtn.style.display = "none";
+
+        if (safeStatus.isBuilding) {
+            // Show building state
+            graphStateIcon.innerHTML =
+                '<i class="bi bi-circle-fill text-warning"></i>';
+            graphStateText.textContent = "Building Knowledge Graph";
+            graphStateDescription.textContent =
+                "Analyzing entities and relationships from your website data...";
+            if (buildProgress) buildProgress.style.display = "block";
+        } else if (safeStatus.hasGraph && safeStatus.entityCount > 0) {
+            // Show active graph state
+            graphStateIcon.innerHTML =
+                '<i class="bi bi-circle-fill text-success"></i>';
+            graphStateText.textContent = "Knowledge Graph Ready";
+            graphStateDescription.textContent = `Your graph contains ${safeStatus.entityCount} entities, ${safeStatus.relationshipCount} relationships, and ${safeStatus.communityCount} communities.`;
+
+            // Show metrics
+            if (graphMetrics) {
+                graphMetrics.style.display = "flex";
+                const entityCount = document.getElementById("entityCount");
+                const relationshipCount =
+                    document.getElementById("relationshipCount");
+                const communityCount =
+                    document.getElementById("communityCount");
+
+                if (entityCount)
+                    entityCount.textContent = safeStatus.entityCount.toString();
+                if (relationshipCount)
+                    relationshipCount.textContent =
+                        safeStatus.relationshipCount.toString();
+                if (communityCount)
+                    communityCount.textContent =
+                        safeStatus.communityCount.toString();
+            }
+
+            // Show action buttons
+            if (viewEntityGraphBtn)
+                viewEntityGraphBtn.style.display = "inline-block";
+            if (rebuildGraphBtn) rebuildGraphBtn.style.display = "inline-block";
+        } else if (safeStatus.error) {
+            // Show error state
+            graphStateIcon.innerHTML =
+                '<i class="bi bi-circle-fill text-danger"></i>';
+            graphStateText.textContent = "Graph Status Error";
+            graphStateDescription.textContent = safeStatus.error;
+            if (buildGraphBtn) buildGraphBtn.style.display = "inline-block";
+        } else {
+            // Show empty state
+            graphStateIcon.innerHTML =
+                '<i class="bi bi-circle-fill text-secondary"></i>';
+            graphStateText.textContent = "No Knowledge Graph";
+            graphStateDescription.textContent =
+                "Build a knowledge graph to visualize relationships between entities, topics, and pages in your library.";
+            if (buildGraphBtn) buildGraphBtn.style.display = "inline-block";
+        }
+    }
+
+    private setupKnowledgeGraphModalEventListeners() {
+        const viewEntityGraphBtn =
+            document.getElementById("viewEntityGraphBtn");
+        const rebuildGraphBtn = document.getElementById("rebuildGraphBtn");
+        const buildGraphBtn = document.getElementById("buildGraphBtn");
+
+        // Remove existing listeners to avoid duplicates
+        viewEntityGraphBtn?.removeEventListener(
+            "click",
+            this.handleViewEntityGraph,
+        );
+        rebuildGraphBtn?.removeEventListener("click", this.handleRebuildGraph);
+        buildGraphBtn?.removeEventListener("click", this.handleBuildGraph);
+
+        // Add new listeners
+        if (viewEntityGraphBtn) {
+            viewEntityGraphBtn.addEventListener(
+                "click",
+                this.handleViewEntityGraph.bind(this),
+            );
+        }
+        if (rebuildGraphBtn) {
+            rebuildGraphBtn.addEventListener(
+                "click",
+                this.handleRebuildGraph.bind(this),
+            );
+        }
+        if (buildGraphBtn) {
+            buildGraphBtn.addEventListener(
+                "click",
+                this.handleBuildGraph.bind(this),
+            );
+        }
+    }
+
+    private handleViewEntityGraph() {
+        // Close the modal and open entity graph view
+        const modal = document.getElementById("knowledgeGraphModal");
+        if (modal) {
+            const bootstrapModal = (window as any).bootstrap.Modal.getInstance(
+                modal,
+            );
+            if (bootstrapModal) {
+                bootstrapModal.hide();
+            }
+        }
+
+        // Open entity graph view
+        window.open("entityGraphView.html", "_blank");
+    }
+
+    private async handleBuildGraph() {
+        try {
+            // Show building state
+            this.updateGraphStatusDisplay({
+                hasGraph: false,
+                entityCount: 0,
+                relationshipCount: 0,
+                communityCount: 0,
+                isBuilding: true,
+            });
+
+            // Start graph building in minimal mode for testing
+            await extensionService.buildKnowledgeGraph({
+                minimalMode: true,
+                urlLimit: 100,
+            });
+
+            // Reload status after building
+            await this.loadGraphStatus();
+
+            notificationManager.showSuccess(
+                "Knowledge graph built successfully!",
+            );
+        } catch (error) {
+            console.error("Failed to build graph:", error);
+            const errorMessage =
+                error instanceof Error ? error.message : "Unknown error";
+            notificationManager.showError(
+                `Failed to build knowledge graph: ${errorMessage}`,
+            );
+
+            // Reset to error state
+            this.updateGraphStatusDisplay({
+                hasGraph: false,
+                entityCount: 0,
+                relationshipCount: 0,
+                communityCount: 0,
+                isBuilding: false,
+                error: errorMessage,
+            });
+        }
+    }
+
+    private async handleRebuildGraph() {
+        try {
+            // Show building state
+            this.updateGraphStatusDisplay({
+                hasGraph: false,
+                entityCount: 0,
+                relationshipCount: 0,
+                communityCount: 0,
+                isBuilding: true,
+            });
+
+            // Rebuild graph
+            await extensionService.rebuildKnowledgeGraph();
+
+            // Reload status after rebuilding
+            await this.loadGraphStatus();
+
+            notificationManager.showSuccess(
+                "Knowledge graph rebuilt successfully!",
+            );
+        } catch (error) {
+            console.error("Failed to rebuild graph:", error);
+            const errorMessage =
+                error instanceof Error ? error.message : "Unknown error";
+            notificationManager.showError(
+                `Failed to rebuild knowledge graph: ${errorMessage}`,
+            );
+
+            // Reset to error state
+            this.updateGraphStatusDisplay({
+                hasGraph: false,
+                entityCount: 0,
+                relationshipCount: 0,
+                communityCount: 0,
+                isBuilding: false,
+                error: errorMessage,
+            });
+        }
     }
 
     public performSearchWithQuery(query: string) {

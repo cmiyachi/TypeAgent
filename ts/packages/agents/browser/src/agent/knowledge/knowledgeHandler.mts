@@ -2,15 +2,37 @@
 // Licensed under the MIT License.
 
 import { SessionContext } from "@typeagent/agent-sdk";
-import { BrowserActionContext } from "../actionHandler.mjs";
-import { searchWebMemories } from "../searchWebMemories.mjs";
+import { WebSocket } from "ws";
+import { BrowserActionContext } from "../browserActions.mjs";
+import { searchByEntities, searchWebMemories } from "../searchWebMemories.mjs";
 import * as website from "website-memory";
+import {
+    knowledgeProgressEvents,
+    KnowledgeExtractionProgressEvent,
+} from "./knowledgeProgressEvents.mjs";
 import {
     KnowledgeExtractionResult,
     EnhancedKnowledgeExtractionResult,
     Entity,
     Relationship,
 } from "./schema/knowledgeExtraction.mjs";
+// TODO: Move this to common and use the same schema in extension and agent
+interface KnowledgeExtractionProgress {
+    extractionId: string;
+    phase:
+        | "content"
+        | "basic"
+        | "summary"
+        | "analyzing"
+        | "extracting"
+        | "complete"
+        | "error";
+    totalItems: number;
+    processedItems: number;
+    currentItem: string | undefined;
+    errors: Array<{ message: string; timestamp: number }>;
+    incrementalData: any | undefined;
+}
 import {
     ExtractionMode,
     ExtractionInput,
@@ -18,6 +40,47 @@ import {
 } from "website-memory";
 import { BrowserKnowledgeExtractor } from "./browserKnowledgeExtractor.mjs";
 import { DetailedKnowledgeStats } from "../browserKnowledgeSchema.js";
+import registerDebug from "debug";
+const debug = registerDebug("typeagent:browser:knowledge");
+
+/**
+ * Knowledge extraction progress update helper function
+ */
+export function sendKnowledgeExtractionProgressViaWebSocket(
+    webSocket: WebSocket | undefined,
+    extractionId: string,
+    progress: KnowledgeExtractionProgress,
+) {
+    try {
+        if (webSocket && webSocket.readyState === WebSocket.OPEN) {
+            // Send progress update message via WebSocket
+            const progressMessage = {
+                method: "knowledgeExtractionProgress",
+                params: {
+                    extractionId: extractionId,
+                    progress: progress,
+                },
+                source: "browserAgent",
+            };
+
+            webSocket.send(JSON.stringify(progressMessage));
+            debug(
+                `Knowledge Extraction Progress [${extractionId}] sent via WebSocket:`,
+                progress,
+            );
+        } else {
+            debug(
+                `Knowledge Extraction Progress [${extractionId}] (WebSocket not available):`,
+                progress,
+            );
+        }
+    } catch (error) {
+        console.error(
+            `Failed to send knowledge extraction progress [${extractionId}]:`,
+            error,
+        );
+    }
+}
 
 // Analytics Data Response Interface
 interface AnalyticsDataResponse {
@@ -147,41 +210,39 @@ function aggregateExtractionResults(results: any[]): {
     let totalReadingTime = 0;
 
     for (const result of results) {
-        if (result.knowledge) {
+        if (result.knowledge || result.partialKnowledge) {
+            const knowledge = result.knowledge || result.partialKnowledge;
             // Collect entities with frame context
-            if (result.knowledge.entities) {
-                allEntities.push(...result.knowledge.entities);
+            if (knowledge.entities) {
+                allEntities.push(...knowledge.entities);
             }
 
             // Collect relationships
-            if (result.knowledge.relationships) {
-                allRelationships.push(...result.knowledge.relationships);
+            if (knowledge.relationships) {
+                allRelationships.push(...knowledge.relationships);
             }
 
             // Collect topics
-            if (result.knowledge.topics) {
-                allTopics.push(...result.knowledge.topics);
+            if (knowledge.topics) {
+                allTopics.push(...knowledge.topics);
             }
 
             // Collect questions
-            if (result.knowledge.suggestedQuestions) {
-                allQuestions.push(...result.knowledge.suggestedQuestions);
+            if (knowledge.suggestedQuestions) {
+                allQuestions.push(...knowledge.suggestedQuestions);
             }
 
             // Collect summaries
-            if (result.knowledge.summary) {
-                summaries.push(result.knowledge.summary);
+            if (knowledge.summary) {
+                summaries.push(knowledge.summary);
             }
 
             // collect content actions
-            if (
-                result.knowledge.actions &&
-                Array.isArray(result.knowledge.actions)
-            ) {
-                allContentActions.push(...result.knowledge.actions);
+            if (knowledge.actions && Array.isArray(knowledge.actions)) {
+                allContentActions.push(...knowledge.actions);
 
                 const actionRelationships =
-                    result.knowledge.actions?.map((action: any) => ({
+                    knowledge.actions?.map((action: any) => ({
                         from: action.subjectEntityName || "unknown",
                         relationship: action.verbs?.join(", ") || "related to",
                         to: action.objectEntityName || "unknown",
@@ -204,13 +265,43 @@ function aggregateExtractionResults(results: any[]): {
         }
     }
 
-    // Deduplicate entities by name and type
-    const uniqueEntities = allEntities.filter(
-        (entity, index, arr) =>
-            arr.findIndex(
-                (e) => e.name === entity.name && e.type === entity.type,
-            ) === index,
-    );
+    // Deduplicate entities by name, keeping the most comprehensive version
+    const entityMap = new Map<string, Entity>();
+
+    allEntities.forEach((entity) => {
+        const key = entity.name.toLowerCase();
+        const existing = entityMap.get(key);
+
+        // Keep the entity with more comprehensive data
+        // Prefer entities with: description, higher confidence, or more properties
+        if (!existing) {
+            entityMap.set(key, entity);
+        } else {
+            const existingScore =
+                (existing.description ? 2 : 0) +
+                (existing.confidence || 0) +
+                Object.keys(existing).length * 0.1;
+            const newScore =
+                (entity.description ? 2 : 0) +
+                (entity.confidence || 0) +
+                Object.keys(entity).length * 0.1;
+
+            if (newScore > existingScore) {
+                // Merge the best of both entities
+                entityMap.set(key, {
+                    ...existing,
+                    ...entity,
+                    // Keep the best confidence
+                    confidence: Math.max(
+                        existing.confidence || 0,
+                        entity.confidence || 0,
+                    ),
+                });
+            }
+        }
+    });
+
+    const uniqueEntities = Array.from(entityMap.values());
 
     // Deduplicate relationships
     const uniqueRelationships = allRelationships.filter(
@@ -313,6 +404,9 @@ export async function handleKnowledgeAction(
         case "extractKnowledgeFromPage":
             return await extractKnowledgeFromPage(parameters, context);
 
+        case "extractKnowledgeFromPageStreaming":
+            return await extractKnowledgeFromPageStreaming(parameters, context);
+
         case "indexWebPageContent":
             return await indexWebPageContent(parameters, context);
 
@@ -363,6 +457,27 @@ export async function handleKnowledgeAction(
 
         case "getAnalyticsData":
             return await getAnalyticsData(parameters, context);
+
+        case "getKnowledgeGraphStatus":
+            return await getKnowledgeGraphStatus(parameters, context);
+
+        case "buildKnowledgeGraph":
+            return await buildKnowledgeGraph(parameters, context);
+
+        case "rebuildKnowledgeGraph":
+            return await rebuildKnowledgeGraph(parameters, context);
+
+        case "getAllRelationships":
+            return await getAllRelationships(parameters, context);
+
+        case "getAllCommunities":
+            return await getAllCommunities(parameters, context);
+
+        case "getAllEntitiesWithMetrics":
+            return await getAllEntitiesWithMetrics(parameters, context);
+
+        case "getEntityNeighborhood":
+            return await getEntityNeighborhood(parameters, context);
 
         default:
             throw new Error(`Unknown knowledge action: ${actionName}`);
@@ -425,15 +540,457 @@ export async function extractKnowledgeFromPage(
     }
 }
 
+export async function extractKnowledgeFromPageStreaming(
+    parameters: {
+        url: string;
+        title: string;
+        mode: string;
+        extractionId: string;
+        htmlFragments: any[];
+        extractionSettings?: any;
+    },
+    context: SessionContext<BrowserActionContext>,
+): Promise<EnhancedKnowledgeExtractionResult> {
+    const { url, mode, extractionId, htmlFragments } = parameters;
+    const extractionMode = mode as ExtractionMode;
+
+    let totalItems = 0;
+    let processedItems = 0;
+    const startTime = Date.now();
+
+    const sendProgressUpdate = async (
+        phase: KnowledgeExtractionProgress["phase"],
+        currentItem?: string,
+        incrementalData?: Partial<any>,
+    ) => {
+        processedItems++;
+        const progress: KnowledgeExtractionProgress = {
+            extractionId,
+            phase,
+            totalItems: totalItems,
+            processedItems,
+            currentItem: currentItem || undefined,
+            errors: [],
+            incrementalData: incrementalData || undefined,
+        };
+
+        const progressEvent: KnowledgeExtractionProgressEvent = {
+            ...progress,
+            timestamp: Date.now(),
+            url: parameters.url,
+            source: "navigation",
+        };
+        knowledgeProgressEvents.emitProgress(progressEvent);
+
+        debug("Knowledge extraction progress:", {
+            extractionId,
+            progress: JSON.stringify(progress),
+        });
+    };
+
+    try {
+        const extractionInputs = createExtractionInputsFromFragments(
+            htmlFragments,
+            url,
+            parameters.title,
+            "direct",
+        );
+
+        if (extractionInputs.length === 0) {
+            await sendProgressUpdate(
+                "error",
+                "Insufficient content to extract knowledge",
+            );
+            return {
+                entities: [],
+                relationships: [],
+                keyTopics: [],
+                suggestedQuestions: [],
+                summary: "Insufficient content to extract knowledge.",
+                contentMetrics: { readingTime: 0, wordCount: 0 },
+            };
+        }
+
+        // Phase 1: Content retrieval feedback
+        await sendProgressUpdate(
+            "content",
+            "Analyzing page structure and content",
+            {
+                contentMetrics: extractContentMetrics(extractionInputs),
+                url,
+                title: parameters.title,
+            },
+        );
+
+        const extractor = new BrowserKnowledgeExtractor(context);
+
+        // Phase 2: Basic extraction
+        await sendProgressUpdate("basic", "Processing basic page information");
+
+        let aggregatedResults: any = {
+            entities: [],
+            relationships: [],
+            keyTopics: [],
+            suggestedQuestions: [],
+            summary: "",
+            contentActions: [],
+            contentMetrics: { readingTime: 0, wordCount: 0 },
+        };
+
+        // Always extract basic info regardless of mode
+        if (
+            extractionMode === "basic" ||
+            shouldIncludeMode("basic", extractionMode)
+        ) {
+            const basicResults = await extractor.extractBatchWithEvents(
+                extractionInputs,
+                "basic",
+                async (progress) => {
+                    debug("Basic extraction progress:", progress);
+                    if (
+                        progress.intermediateResults &&
+                        progress.intermediateResults.length > 0
+                    ) {
+                        const partialAggregated = aggregateExtractionResults(
+                            progress.intermediateResults,
+                        );
+                        totalItems = progress.total;
+                        processedItems = progress.processed;
+                        let progressMessage;
+                        if (
+                            progress.currentItemChunk &&
+                            progress.currentItemTotalChunks
+                        ) {
+                            progressMessage = `Processing chunk ${progress.currentItemChunk} of ${progress.currentItemTotalChunks} (${progress.processed} of ${progress.total} total chunks)`;
+                        } else {
+                            progressMessage = `Processing chunks: ${progress.processed} of ${progress.total} completed`;
+                        }
+
+                        await sendProgressUpdate(
+                            "basic",
+                            progressMessage,
+                            partialAggregated,
+                        );
+                    }
+                },
+                3,
+            );
+            aggregatedResults = aggregateExtractionResults(basicResults);
+
+            await sendProgressUpdate(
+                "basic",
+                "Basic analysis complete",
+                aggregatedResults,
+            );
+        }
+
+        // Phase 3: Summary mode (if enabled)
+        if (shouldIncludeMode("summary", extractionMode)) {
+            await sendProgressUpdate("summary", "Generating content summary");
+
+            const summaryResults = await extractor.extractBatchWithEvents(
+                extractionInputs,
+                "summary",
+                async (progress) => {
+                    debug("Summary extraction progress:", progress);
+                    if (
+                        progress.intermediateResults &&
+                        progress.intermediateResults.length > 0
+                    ) {
+                        const partialData = aggregateExtractionResults(
+                            progress.intermediateResults,
+                        );
+                        totalItems = progress.total;
+                        processedItems = progress.processed;
+
+                        await sendProgressUpdate(
+                            "summary",
+                            `Summarizing: ${progress.processed} of ${progress.total} chunks processed`,
+                            partialData,
+                        );
+                    }
+                },
+                3,
+            );
+            const summaryData = aggregateExtractionResults(summaryResults);
+
+            // Replace with LLM-based summary data
+            aggregatedResults.summary = summaryData.summary;
+
+            // Replace topics with summary extraction results if available
+            // Summary extraction provides higher-fidelity topics than basic extraction
+            if (summaryData.keyTopics && summaryData.keyTopics.length > 0) {
+                aggregatedResults.keyTopics = summaryData.keyTopics;
+            }
+
+            // If summary extraction provides entities, replace basic ones
+            if (summaryData.entities && summaryData.entities.length > 0) {
+                aggregatedResults.entities = summaryData.entities;
+            }
+
+            // If summary extraction provides relationships, replace basic ones
+            if (
+                summaryData.relationships &&
+                summaryData.relationships.length > 0
+            ) {
+                aggregatedResults.relationships = summaryData.relationships;
+            }
+
+            await sendProgressUpdate(
+                "summary",
+                "Summary analysis complete",
+                aggregatedResults, // Send the full aggregated results, not just summary/topics
+            );
+        }
+
+        // Phase 4: Content analysis (if enabled)
+        if (shouldIncludeMode("content", extractionMode)) {
+            await sendProgressUpdate(
+                "analyzing",
+                "Discovering entities and topics",
+            );
+
+            const contentResults = await extractor.extractBatchWithEvents(
+                extractionInputs,
+                "content",
+                async (progress) => {
+                    debug("Content extraction progress:", progress);
+                    if (
+                        progress.intermediateResults &&
+                        progress.intermediateResults.length > 0
+                    ) {
+                        const partialData = aggregateExtractionResults(
+                            progress.intermediateResults,
+                        );
+                        totalItems = progress.total;
+                        processedItems = progress.processed;
+                        await sendProgressUpdate(
+                            "analyzing",
+                            `Analyzing content: ${progress.processed} of ${progress.total} chunks processed`,
+                            partialData,
+                        );
+                    }
+                },
+                3,
+            );
+            const contentData = aggregateExtractionResults(contentResults);
+
+            // Replace basic extraction with LLM-based content extraction
+            // LLM extraction provides higher-fidelity knowledge than rule-based basic extraction
+            if (contentData.entities && contentData.entities.length > 0) {
+                // Replace entities entirely with content extraction results
+                aggregatedResults.entities = contentData.entities;
+            }
+
+            // Replace topics with content extraction results
+            if (contentData.keyTopics && contentData.keyTopics.length > 0) {
+                // Replace topics entirely with content extraction results
+                aggregatedResults.keyTopics = contentData.keyTopics;
+            }
+
+            // Replace relationships with content extraction results
+            if (
+                contentData.relationships &&
+                contentData.relationships.length > 0
+            ) {
+                // Replace relationships entirely with content extraction results
+                aggregatedResults.relationships = contentData.relationships;
+            }
+
+            // Merge content actions (these are saved as "actions" in the index)
+            if (
+                contentData.contentActions &&
+                contentData.contentActions.length > 0
+            ) {
+                aggregatedResults.contentActions = [
+                    ...(aggregatedResults.contentActions || []),
+                    ...contentData.contentActions,
+                ];
+            }
+
+            await sendProgressUpdate(
+                "analyzing",
+                "Discovered entities and topics",
+                aggregatedResults, // Send full accumulated results
+            );
+        }
+
+        // Phase 5: Full extraction with relationships (if enabled)
+        if (shouldIncludeMode("full", extractionMode)) {
+            await sendProgressUpdate(
+                "extracting",
+                "Analyzing entity relationships",
+            );
+
+            const fullResults = await extractor.extractBatchWithEvents(
+                extractionInputs,
+                "full",
+                async (progress) => {
+                    debug("Full extraction progress:", progress);
+                    if (
+                        progress.intermediateResults &&
+                        progress.intermediateResults.length > 0
+                    ) {
+                        const partialData = aggregateExtractionResults(
+                            progress.intermediateResults,
+                        );
+                        totalItems = progress.total;
+                        processedItems = progress.processed;
+                        await sendProgressUpdate(
+                            "extracting",
+                            `Extracting relationships: ${progress.processed} of ${progress.total} chunks processed`,
+                            partialData,
+                        );
+                    }
+                },
+                3,
+            );
+            const fullData = aggregateExtractionResults(fullResults);
+
+            // Replace with full extraction results - highest fidelity LLM extraction
+            // Full extraction provides the most comprehensive relationship analysis
+            if (fullData.relationships && fullData.relationships.length > 0) {
+                aggregatedResults.relationships = fullData.relationships;
+            }
+
+            // If full extraction provides entities, replace previous ones
+            if (fullData.entities && fullData.entities.length > 0) {
+                aggregatedResults.entities = fullData.entities;
+            }
+
+            // If full extraction provides topics, replace previous ones
+            if (fullData.keyTopics && fullData.keyTopics.length > 0) {
+                aggregatedResults.keyTopics = fullData.keyTopics;
+            }
+
+            // Merge content actions from full extraction if present
+            if (fullData.contentActions && fullData.contentActions.length > 0) {
+                aggregatedResults.contentActions = [
+                    ...(aggregatedResults.contentActions || []),
+                    ...fullData.contentActions,
+                ];
+            }
+
+            await sendProgressUpdate(
+                "extracting",
+                "Analyzed entity relationships",
+                aggregatedResults, // Send full accumulated results
+            );
+        }
+
+        // Final completion
+        await sendProgressUpdate(
+            "complete",
+            "Knowledge extraction completed successfully",
+            aggregatedResults,
+        );
+
+        debug("Knowledge extraction complete:", {
+            extractionId,
+            finalData: aggregatedResults,
+            totalTime: Date.now() - startTime,
+        });
+
+        return aggregatedResults;
+    } catch (error) {
+        console.error("Error in streaming knowledge extraction:", error);
+
+        // Send error progress update via WebSocket
+        const errorProgress: KnowledgeExtractionProgress = {
+            extractionId,
+            phase: "error",
+            totalItems: totalItems,
+            processedItems,
+            currentItem: undefined,
+            errors: [
+                {
+                    message: (error as Error).message || String(error),
+                    timestamp: Date.now(),
+                },
+            ],
+            incrementalData: undefined,
+        };
+
+        sendKnowledgeExtractionProgressViaWebSocket(
+            context.agentContext.webSocket,
+            extractionId,
+            errorProgress,
+        );
+
+        throw error;
+    }
+}
+
+function shouldIncludeMode(
+    checkMode: ExtractionMode,
+    actualMode: ExtractionMode,
+): boolean {
+    /*
+    const modeOrder = ["basic", "summary", "content", "full"];
+    const checkIndex = modeOrder.indexOf(checkMode);
+    const actualIndex = modeOrder.indexOf(actualMode);
+    return actualIndex >= checkIndex;
+    */
+    // for now, only return the selected mode and "basic"
+    return checkMode === "basic" || checkMode === actualMode;
+}
+
+function extractContentMetrics(extractionInputs: ExtractionInput[]) {
+    const totalWordCount = extractionInputs.reduce((sum, input) => {
+        return sum + (input.textContent?.split(/\s+/).length || 0);
+    }, 0);
+
+    return {
+        wordCount: totalWordCount,
+        readingTime: Math.ceil(totalWordCount / 200), // 200 words per minute
+    };
+}
+
+// Convert aggregated results to actions array, handling both contentActions and relationships
+function getActionsFromAggregatedResults(aggregatedResults: any): any[] {
+    // If we have contentActions, use them directly
+    if (
+        aggregatedResults.contentActions &&
+        Array.isArray(aggregatedResults.contentActions) &&
+        aggregatedResults.contentActions.length > 0
+    ) {
+        return aggregatedResults.contentActions;
+    }
+
+    // If we have relationships but no contentActions, convert relationships to actions
+    if (
+        aggregatedResults.relationships &&
+        Array.isArray(aggregatedResults.relationships) &&
+        aggregatedResults.relationships.length > 0
+    ) {
+        return aggregatedResults.relationships.map((relationship: any) => ({
+            verbs: relationship.relationship
+                ? relationship.relationship
+                      .split(/[,\s]+/)
+                      .filter((v: string) => v.trim().length > 0)
+                : ["related to"],
+            verbTense: "present" as "past" | "present" | "future",
+            subjectEntityName: relationship.from || "none",
+            objectEntityName: relationship.to || "none",
+            indirectObjectEntityName: "none",
+            params: [],
+            confidence: relationship.confidence || 0.8,
+        }));
+    }
+
+    return [];
+}
+
 export async function indexWebPageContent(
     parameters: {
         url: string;
         title: string;
-        htmlFragments: any[];
+        htmlFragments?: any[];
         extractKnowledge: boolean;
         timestamp: string;
         textOnly?: boolean;
         mode?: "basic" | "content" | "full";
+        extractedKnowledge?: any;
     },
     context: SessionContext<BrowserActionContext>,
 ): Promise<{
@@ -442,31 +999,39 @@ export async function indexWebPageContent(
     entityCount: number;
 }> {
     try {
-        // Create individual extraction inputs for each HTML fragment
-        const extractionInputs = createExtractionInputsFromFragments(
-            parameters.htmlFragments,
-            parameters.url,
-            parameters.title,
-            "index",
-            parameters.timestamp,
-        );
+        let aggregatedResults: any;
+        let combinedTextContent = "";
 
-        const extractionMode = parameters.mode || "content";
-        const extractor = new BrowserKnowledgeExtractor(context);
+        if (parameters.extractedKnowledge) {
+            aggregatedResults = parameters.extractedKnowledge;
+            combinedTextContent = aggregatedResults.summary || "";
+        } else {
+            // Create individual extraction inputs for each HTML fragment
+            const extractionInputs = createExtractionInputsFromFragments(
+                parameters.htmlFragments!,
+                parameters.url,
+                parameters.title,
+                "index",
+                parameters.timestamp,
+            );
 
-        // Process each fragment individually using batch processing
-        const extractionResults = await extractor.extractBatch(
-            extractionInputs,
-            extractionMode,
-        );
+            const extractionMode = parameters.mode || "content";
+            const extractor = new BrowserKnowledgeExtractor(context);
 
-        // Aggregate results for indexing
-        const aggregatedResults = aggregateExtractionResults(extractionResults);
+            // Process each fragment individually using batch processing
+            const extractionResults = await extractor.extractBatch(
+                extractionInputs,
+                extractionMode,
+            );
 
-        // Create combined text content for website memory indexing
-        const combinedTextContent = extractionInputs
-            .map((input) => input.textContent)
-            .join("\n\n");
+            // Aggregate results for indexing
+            aggregatedResults = aggregateExtractionResults(extractionResults);
+
+            // Create combined text content for website memory indexing
+            combinedTextContent = extractionInputs
+                .map((input) => input.textContent)
+                .join("\n\n");
+        }
 
         const visitInfo: website.WebsiteVisitInfo = {
             url: parameters.url,
@@ -483,14 +1048,14 @@ export async function indexWebPageContent(
         if (aggregatedResults && aggregatedResults.entities.length > 0) {
             // Set knowledge based on what the website-memory package expects
             websiteObj.knowledge = {
-                entities: aggregatedResults.entities.map((entity) => ({
+                entities: aggregatedResults.entities.map((entity: any) => ({
                     ...entity,
                     type: Array.isArray(entity.type)
                         ? entity.type
                         : [entity.type], // Ensure type is array
                 })),
-                topics: aggregatedResults.keyTopics,
-                actions: aggregatedResults.contentActions || [], // Use actual content actions
+                topics: aggregatedResults.keyTopics || aggregatedResults.topics,
+                actions: getActionsFromAggregatedResults(aggregatedResults),
                 inverseActions: [], // Required property
             };
         }
@@ -518,78 +1083,73 @@ export async function indexWebPageContent(
         }
 
         if (context.agentContext.websiteCollection) {
-            if (parameters.extractKnowledge) {
-                try {
-                    const isNewPage = !checkPageExistsInIndex(
-                        parameters.url,
-                        context,
-                    );
+            try {
+                const isNewPage = !checkPageExistsInIndex(
+                    parameters.url,
+                    context,
+                );
 
-                    if (isNewPage) {
-                        const docPart =
-                            website.WebsiteDocPart.fromWebsite(websiteObj);
-                        const result =
-                            await context.agentContext.websiteCollection.addWebsiteToIndex(
-                                docPart,
-                            );
-                        if (hasIndexingErrors(result)) {
-                            console.warn(
-                                "Incremental indexing failed, falling back to full rebuild",
-                            );
-                            context.agentContext.websiteCollection.addWebsites([
-                                websiteObj,
-                            ]);
-                            await context.agentContext.websiteCollection.buildIndex();
-                        }
-                    } else {
-                        const docPart =
-                            website.WebsiteDocPart.fromWebsite(websiteObj);
-                        const result =
-                            await context.agentContext.websiteCollection.updateWebsiteInIndex(
-                                parameters.url,
-                                docPart,
-                            );
-                        if (hasIndexingErrors(result)) {
-                            console.warn(
-                                "Update indexing failed, falling back to full rebuild",
-                            );
-                            context.agentContext.websiteCollection.addWebsites([
-                                websiteObj,
-                            ]);
-                            await context.agentContext.websiteCollection.buildIndex();
-                        }
-                    }
-                } catch (error) {
-                    console.warn(
-                        "Indexing error, falling back to full rebuild:",
-                        error,
-                    );
-                    context.agentContext.websiteCollection.addWebsites([
-                        websiteObj,
-                    ]);
-                    await context.agentContext.websiteCollection.buildIndex();
-                }
-
-                try {
-                    if (context.agentContext.index?.path) {
-                        await context.agentContext.websiteCollection.writeToFile(
-                            context.agentContext.index.path,
-                            "index",
+                if (isNewPage) {
+                    const docPart =
+                        website.WebsiteDocPart.fromWebsite(websiteObj);
+                    const result =
+                        await context.agentContext.websiteCollection.addWebsiteToIndex(
+                            docPart,
                         );
-                        console.log(
-                            `Saved updated website collection to ${context.agentContext.index.path}`,
-                        );
-                    } else {
+                    if (hasIndexingErrors(result)) {
                         console.warn(
-                            "No index path available, indexed page data not persisted to disk",
+                            "Incremental indexing failed, falling back to full rebuild",
                         );
+                        context.agentContext.websiteCollection.addWebsites([
+                            websiteObj,
+                        ]);
+                        await context.agentContext.websiteCollection.buildIndex();
                     }
-                } catch (error) {
-                    console.error(
-                        "Error persisting website collection:",
-                        error,
+                } else {
+                    const docPart =
+                        website.WebsiteDocPart.fromWebsite(websiteObj);
+                    const result =
+                        await context.agentContext.websiteCollection.updateWebsiteInIndex(
+                            parameters.url,
+                            docPart,
+                        );
+                    if (hasIndexingErrors(result)) {
+                        console.warn(
+                            "Update indexing failed, falling back to full rebuild",
+                        );
+                        context.agentContext.websiteCollection.addWebsites([
+                            websiteObj,
+                        ]);
+                        await context.agentContext.websiteCollection.buildIndex();
+                    }
+                }
+            } catch (error) {
+                console.warn(
+                    "Indexing error, falling back to full rebuild:",
+                    error,
+                );
+                context.agentContext.websiteCollection.addWebsites([
+                    websiteObj,
+                ]);
+                await context.agentContext.websiteCollection.buildIndex();
+            }
+
+            try {
+                if (context.agentContext.index?.path) {
+                    await context.agentContext.websiteCollection.writeToFile(
+                        context.agentContext.index.path,
+                        "index",
+                    );
+                    debug(
+                        `Saved updated website collection to ${context.agentContext.index.path}`,
+                    );
+                } else {
+                    console.warn(
+                        "No index path available, indexed page data not persisted to disk",
                     );
                 }
+            } catch (error) {
+                console.error("Error persisting website collection:", error);
             }
         }
 
@@ -759,7 +1319,7 @@ export async function clearKnowledgeIndex(
 }
 
 // Enhanced suggested questions using content analysis and DataFrames
-async function generateSmartSuggestedQuestions(
+export async function generateSmartSuggestedQuestions(
     knowledge: any,
     extractionResult: any,
     url: string,
@@ -780,7 +1340,7 @@ async function generateSmartSuggestedQuestions(
     if (websiteCollection && websiteCollection.visitFrequency) {
         try {
             // Domain visit history - simplified approach for now
-            console.log("Checking domain visit data for enhanced questions");
+            debug("Checking domain visit data for enhanced questions");
 
             if (domain) {
                 questions.push(`When did I first visit ${domain}?`);
@@ -1636,6 +2196,8 @@ export async function getPageIndexedKnowledge(
             );
 
             // Generate contextual questions for indexed content
+            const suggestedQuestions: string[] = [];
+            /*
             const suggestedQuestions: string[] =
                 await generateSmartSuggestedQuestions(
                     knowledge,
@@ -1643,6 +2205,7 @@ export async function getPageIndexedKnowledge(
                     parameters.url,
                     context,
                 );
+            */
 
             // Calculate content metrics from the stored text
             const textContent = foundWebsite.textChunks?.join("\n\n") || "";
@@ -2581,4 +3144,774 @@ export async function getAnalyticsData(
             },
         };
     }
+}
+
+export async function getKnowledgeGraphStatus(
+    parameters: {},
+    context: SessionContext<BrowserActionContext>,
+): Promise<{
+    hasGraph: boolean;
+    entityCount: number;
+    relationshipCount: number;
+    communityCount: number;
+    isBuilding: boolean;
+    error?: string;
+}> {
+    try {
+        const websiteCollection = context.agentContext.websiteCollection;
+
+        if (!websiteCollection) {
+            debug("website collection not found");
+            return {
+                hasGraph: false,
+                entityCount: 0,
+                relationshipCount: 0,
+                communityCount: 0,
+                isBuilding: false,
+                error: "Website collection not available",
+            };
+        }
+
+        // Check if relationships and communities tables exist
+        if (
+            !websiteCollection.relationships ||
+            !websiteCollection.communities
+        ) {
+            // Tables not initialized, no graph exists
+            return {
+                hasGraph: false,
+                entityCount: 0,
+                relationshipCount: 0,
+                communityCount: 0,
+                isBuilding: false,
+            };
+        }
+
+        // Get entity count from knowledge entities table
+        let entityCount = 0;
+        try {
+            if (websiteCollection.knowledgeEntities) {
+                entityCount = (
+                    websiteCollection.knowledgeEntities as any
+                ).getTotalEntityCount();
+            }
+        } catch (error) {
+            console.warn("Failed to get entity count:", error);
+        }
+
+        // Get relationship count
+        let relationshipCount = 0;
+        try {
+            const relationships =
+                websiteCollection.relationships.getAllRelationships();
+            relationshipCount = relationships.length;
+        } catch (error) {
+            console.warn("Failed to get relationship count:", error);
+        }
+
+        // Get community count
+        let communityCount = 0;
+        try {
+            const communities =
+                websiteCollection.communities.getAllCommunities();
+            communityCount = communities.length;
+        } catch (error) {
+            console.warn("Failed to get community count:", error);
+        }
+
+        // Determine if graph exists based on actual data
+        const hasGraph = relationshipCount > 0 || entityCount > 0;
+
+        return {
+            hasGraph: hasGraph,
+            entityCount,
+            relationshipCount,
+            communityCount,
+            isBuilding: false,
+        };
+    } catch (error) {
+        console.error("Error getting knowledge graph status:", error);
+        return {
+            hasGraph: false,
+            entityCount: 0,
+            relationshipCount: 0,
+            communityCount: 0,
+            isBuilding: false,
+            error: error instanceof Error ? error.message : "Unknown error",
+        };
+    }
+}
+
+export async function buildKnowledgeGraph(
+    parameters: {
+        minimalMode?: boolean;
+        urlLimit?: number;
+    },
+    context: SessionContext<BrowserActionContext>,
+): Promise<{
+    success: boolean;
+    message?: string;
+    error?: string;
+    stats?: {
+        urlsProcessed: number;
+        entitiesFound: number;
+        relationshipsCreated: number;
+        communitiesDetected: number;
+        timeElapsed: number;
+    };
+}> {
+    try {
+        const websiteCollection = context.agentContext.websiteCollection;
+
+        if (!websiteCollection) {
+            return {
+                success: false,
+                error: "Website collection not available",
+            };
+        }
+
+        console.log(
+            "[Knowledge Graph] Starting knowledge graph build with parameters:",
+            parameters,
+        );
+        const startTime = Date.now();
+
+        // TODO: Implement actual graph building logic here
+        // This method currently only reports stats from existing data
+        // Actual graph building should process URLs, extract entities/relationships,
+        // run community detection, and calculate metrics
+
+        const timeElapsed = Date.now() - startTime;
+
+        // Get stats directly from websiteCollection using existing status method
+        const status = await getKnowledgeGraphStatus({}, context);
+
+        const stats = {
+            urlsProcessed: parameters.urlLimit || status.entityCount,
+            entitiesFound: status.entityCount,
+            relationshipsCreated: status.relationshipCount,
+            communitiesDetected: status.communityCount,
+            timeElapsed: timeElapsed,
+        };
+
+        console.log("[Knowledge Graph] Build completed:", stats);
+
+        return {
+            success: true,
+            message: `Knowledge graph build completed in ${timeElapsed}ms`,
+            stats,
+        };
+    } catch (error) {
+        console.error("[Knowledge Graph] Error building:", error);
+        return {
+            success: false,
+            error: error instanceof Error ? error.message : "Unknown error",
+        };
+    }
+}
+
+export async function rebuildKnowledgeGraph(
+    parameters: {},
+    context: SessionContext<BrowserActionContext>,
+): Promise<{
+    success: boolean;
+    message?: string;
+    error?: string;
+}> {
+    try {
+        const websiteCollection = context.agentContext.websiteCollection;
+
+        if (!websiteCollection) {
+            return {
+                success: false,
+                error: "Website collection not available",
+            };
+        }
+
+        // Clear existing graph data and rebuild
+        try {
+            // Clear existing graph tables if they exist
+            if (websiteCollection.relationships) {
+                await websiteCollection.relationships.clear();
+            }
+            if (websiteCollection.communities) {
+                await websiteCollection.communities.clear();
+            }
+        } catch (clearError) {
+            // Continue even if clearing fails, as the rebuild might overwrite
+            console.warn("Failed to clear existing graph data:", clearError);
+        }
+
+        // Rebuild the knowledge graph
+        await websiteCollection.buildGraph();
+
+        return {
+            success: true,
+            message: "Knowledge graph rebuilt successfully",
+        };
+    } catch (error) {
+        console.error("Error rebuilding knowledge graph:", error);
+        return {
+            success: false,
+            error: error instanceof Error ? error.message : "Unknown error",
+        };
+    }
+}
+
+export async function getAllRelationships(
+    parameters: {},
+    context: SessionContext<BrowserActionContext>,
+): Promise<{
+    relationships: any[];
+    error?: string;
+}> {
+    try {
+        const websiteCollection = context.agentContext.websiteCollection;
+
+        if (!websiteCollection) {
+            return {
+                relationships: [],
+                error: "Website collection not available",
+            };
+        }
+
+        const relationships =
+            websiteCollection.relationships?.getAllRelationships() || [];
+
+        return {
+            relationships: relationships,
+        };
+    } catch (error) {
+        console.error("Error getting all relationships:", error);
+        return {
+            relationships: [],
+            error: error instanceof Error ? error.message : "Unknown error",
+        };
+    }
+}
+
+export async function getAllCommunities(
+    parameters: {},
+    context: SessionContext<BrowserActionContext>,
+): Promise<{
+    communities: any[];
+    error?: string;
+}> {
+    try {
+        const websiteCollection = context.agentContext.websiteCollection;
+
+        if (!websiteCollection) {
+            return {
+                communities: [],
+                error: "Website collection not available",
+            };
+        }
+
+        const communities =
+            websiteCollection.communities?.getAllCommunities() || [];
+
+        return {
+            communities: communities,
+        };
+    } catch (error) {
+        console.error("Error getting all communities:", error);
+        return {
+            communities: [],
+            error: error instanceof Error ? error.message : "Unknown error",
+        };
+    }
+}
+
+// Simple in-memory cache for graph data
+interface GraphCache {
+    entities: any[];
+    relationships: any[];
+    communities: any[];
+    entityMetrics: any[];
+    lastUpdated: number;
+    isValid: boolean;
+}
+
+// Cache storage attached to websiteCollection
+function getGraphCache(websiteCollection: any): GraphCache | null {
+    return (websiteCollection as any).__graphCache || null;
+}
+
+function setGraphCache(websiteCollection: any, cache: GraphCache): void {
+    (websiteCollection as any).__graphCache = cache;
+}
+
+// Ensure graph data is cached for fast access
+async function ensureGraphCache(websiteCollection: any): Promise<void> {
+    const cache = getGraphCache(websiteCollection);
+    const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+    // Check if cache is valid
+    if (cache && cache.isValid && Date.now() - cache.lastUpdated < CACHE_TTL) {
+        debug("[Knowledge Graph] Using valid cached graph data");
+        return;
+    }
+
+    debug("[Knowledge Graph] Building in-memory cache for graph data");
+
+    try {
+        // Fetch raw data
+        const entities =
+            (websiteCollection.knowledgeEntities as any)?.getTopEntities(
+                5000,
+            ) || [];
+        const relationships =
+            websiteCollection.relationships?.getAllRelationships() || [];
+        const communities =
+            websiteCollection.communities?.getAllCommunities() || [];
+
+        // Calculate metrics
+        const entityMetrics = calculateEntityMetrics(
+            entities,
+            relationships,
+            communities,
+        );
+
+        // Store in cache
+        const newCache: GraphCache = {
+            entities: entities,
+            relationships: relationships,
+            communities: communities,
+            entityMetrics: entityMetrics,
+            lastUpdated: Date.now(),
+            isValid: true,
+        };
+
+        setGraphCache(websiteCollection, newCache);
+
+        debug(
+            `[Knowledge Graph] Cached ${entities.length} entities, ${relationships.length} relationships, ${communities.length} communities`,
+        );
+    } catch (error) {
+        console.error("[Knowledge Graph] Failed to build cache:", error);
+
+        // Mark cache as invalid but keep existing data if available
+        const existingCache = getGraphCache(websiteCollection);
+        if (existingCache) {
+            existingCache.isValid = false;
+        }
+    }
+}
+
+export async function getAllEntitiesWithMetrics(
+    parameters: {},
+    context: SessionContext<BrowserActionContext>,
+): Promise<{
+    entities: any[];
+    error?: string;
+}> {
+    try {
+        const websiteCollection = context.agentContext.websiteCollection;
+
+        if (!websiteCollection) {
+            return {
+                entities: [],
+                error: "Website collection not available",
+            };
+        }
+
+        // Ensure cache is populated
+        await ensureGraphCache(websiteCollection);
+
+        // Get cached data
+        const cache = getGraphCache(websiteCollection);
+        if (cache && cache.isValid && cache.entityMetrics.length > 0) {
+            debug(
+                `[Knowledge Graph] Using cached entity data: ${cache.entityMetrics.length} entities`,
+            );
+            return {
+                entities: cache.entityMetrics,
+            };
+        }
+
+        // Fallback to live computation if no cache
+        console.log(
+            "[Knowledge Graph] Cache not available, computing entities with metrics",
+        );
+        const entities =
+            (websiteCollection.knowledgeEntities as any)?.getTopEntities(
+                5000,
+            ) || [];
+        const relationships =
+            websiteCollection.relationships?.getAllRelationships() || [];
+        const communities =
+            websiteCollection.communities?.getAllCommunities() || [];
+
+        const entityMetrics = calculateEntityMetrics(
+            entities,
+            relationships,
+            communities,
+        );
+
+        return {
+            entities: entityMetrics,
+        };
+    } catch (error) {
+        console.error("Error getting all entities with metrics:", error);
+        return {
+            entities: [],
+            error: error instanceof Error ? error.message : "Unknown error",
+        };
+    }
+}
+
+export async function getEntityNeighborhood(
+    parameters: {
+        entityId: string;
+        depth?: number;
+        maxNodes?: number;
+    },
+    context: SessionContext<BrowserActionContext>,
+): Promise<{
+    centerEntity?: any;
+    neighbors: any[];
+    relationships: any[];
+    searchData?: any;
+    metadata?: any;
+    error?: string;
+}> {
+    try {
+        const websiteCollection = context.agentContext.websiteCollection;
+
+        if (!websiteCollection) {
+            return {
+                neighbors: [],
+                relationships: [],
+                error: "Website collection not available",
+            };
+        }
+
+        const { entityId, depth = 2, maxNodes = 100 } = parameters;
+
+        // Ensure cache is populated
+        await ensureGraphCache(websiteCollection);
+
+        // Get cached data
+        const cache = getGraphCache(websiteCollection);
+        if (!cache || !cache.isValid) {
+            return {
+                neighbors: [],
+                relationships: [],
+                error: "Graph cache not available",
+            };
+        }
+
+        debug(
+            `[Knowledge Graph] Performing BFS for entity "${entityId}" (depth: ${depth}, maxNodes: ${maxNodes})`,
+        );
+
+        // Perform BFS to find neighborhood
+        const neighborhoodResult = performBFS(
+            entityId,
+            cache.entityMetrics,
+            cache.relationships,
+            depth,
+            maxNodes,
+        );
+
+        if (!neighborhoodResult.centerEntity) {
+            const searchNeibhbors = await searchByEntities(
+                { entities: [entityId], maxResults: 20 },
+                context,
+            );
+
+            if (searchNeibhbors) {
+                return {
+                    centerEntity: {
+                        id: entityId,
+                        name: entityId,
+                        type: "entity",
+                        confidence: 0.5,
+                        count: 1,
+                    },
+                    neighbors: searchNeibhbors.relatedEntities || [],
+                    relationships: [],
+                    searchData: {
+                        relatedEntities: searchNeibhbors?.relatedEntities || [],
+                        topTopics: searchNeibhbors?.topTopics || [],
+                        websites: searchNeibhbors?.websites || [],
+                    },
+                    metadata: {
+                        source: "in_memory_cache",
+                        queryDepth: depth,
+                        maxNodes: maxNodes,
+                        actualNodes:
+                            (searchNeibhbors?.relatedEntities?.length || 0) + 1,
+                        actualEdges: 0,
+                        searchEnrichment: {
+                            relatedEntities:
+                                searchNeibhbors?.relatedEntities?.length || 0,
+                            topTopics: searchNeibhbors?.topTopics?.length || 0,
+                            websites: searchNeibhbors?.websites?.length || 0,
+                        },
+                    },
+                };
+            } else {
+                return {
+                    neighbors: [],
+                    relationships: [],
+                    error: `Entity "${entityId}" not found`,
+                };
+            }
+        }
+
+        // Get search enrichment for topics and related entities
+        let searchData: any = null;
+        try {
+            const searchResults = await searchByEntities(
+                { entities: [entityId], maxResults: 20 },
+                context,
+            );
+
+            if (searchResults) {
+                searchData = {
+                    websites: searchResults.websites?.slice(0, 15) || [],
+                    relatedEntities:
+                        searchResults.relatedEntities?.slice(0, 15) || [],
+                    topTopics: searchResults.topTopics?.slice(0, 10) || [],
+                };
+
+                debug(
+                    `[Knowledge Graph] Search enrichment found: ${searchData.websites.length} websites, ${searchData.relatedEntities.length} related entities, ${searchData.topTopics.length} topics`,
+                );
+            }
+        } catch (searchError) {
+            console.warn(
+                `[Knowledge Graph] Search enrichment failed:`,
+                searchError,
+            );
+        }
+
+        return {
+            centerEntity: neighborhoodResult.centerEntity,
+            neighbors: neighborhoodResult.neighbors,
+            relationships: neighborhoodResult.relationships,
+            searchData: {
+                relatedEntities: searchData?.relatedEntities || [],
+                topTopics: searchData?.topTopics || [],
+                websites: searchData?.websites || [],
+            },
+            metadata: {
+                source: "in_memory_cache",
+                queryDepth: depth,
+                maxNodes: maxNodes,
+                actualNodes: neighborhoodResult.neighbors.length + 1,
+                actualEdges: neighborhoodResult.relationships.length,
+                searchEnrichment: {
+                    relatedEntities: searchData?.relatedEntities?.length || 0,
+                    topTopics: searchData?.topTopics?.length || 0,
+                    websites: searchData?.websites?.length || 0,
+                },
+            },
+        };
+    } catch (error) {
+        console.error("Error getting entity neighborhood:", error);
+        return {
+            neighbors: [],
+            relationships: [],
+            error: error instanceof Error ? error.message : "Unknown error",
+        };
+    }
+}
+
+// BFS implementation for finding entity neighborhood
+function performBFS(
+    entityId: string,
+    entities: any[],
+    relationships: any[],
+    maxDepth: number,
+    maxNodes: number,
+): {
+    centerEntity?: any;
+    neighbors: any[];
+    relationships: any[];
+} {
+    // Find center entity (case insensitive)
+    const centerEntity = entities.find(
+        (e) =>
+            e.name?.toLowerCase() === entityId.toLowerCase() ||
+            e.id?.toLowerCase() === entityId.toLowerCase(),
+    );
+
+    if (!centerEntity) {
+        return { neighbors: [], relationships: [] };
+    }
+
+    // Build adjacency map for fast lookups
+    const adjacencyMap = new Map<string, any[]>();
+    const relationshipMap = new Map<string, any>();
+
+    relationships.forEach((rel) => {
+        const fromName = rel.fromEntity || rel.from;
+        const toName = rel.toEntity || rel.to;
+
+        if (fromName && toName) {
+            // Normalize entity names for lookup
+            const fromKey = fromName.toLowerCase();
+            const toKey = toName.toLowerCase();
+
+            if (!adjacencyMap.has(fromKey)) adjacencyMap.set(fromKey, []);
+            if (!adjacencyMap.has(toKey)) adjacencyMap.set(toKey, []);
+
+            adjacencyMap.get(fromKey)!.push(toKey);
+            adjacencyMap.get(toKey)!.push(fromKey);
+
+            const relKey = `${fromKey}-${toKey}`;
+            const relKey2 = `${toKey}-${fromKey}`;
+            relationshipMap.set(relKey, rel);
+            relationshipMap.set(relKey2, rel);
+        }
+    });
+
+    // BFS traversal
+    const visited = new Set<string>();
+    const queue: Array<{ entityName: string; depth: number }> = [];
+    const result = {
+        neighbors: [] as any[],
+        relationships: [] as any[],
+    };
+
+    const centerKey =
+        centerEntity.name?.toLowerCase() || centerEntity.id?.toLowerCase();
+    queue.push({ entityName: centerKey, depth: 0 });
+    visited.add(centerKey);
+
+    while (queue.length > 0 && result.neighbors.length < maxNodes) {
+        const current = queue.shift()!;
+
+        if (current.depth > 0) {
+            // Find the actual entity object
+            const entity = entities.find(
+                (e) =>
+                    e.name?.toLowerCase() === current.entityName ||
+                    e.id?.toLowerCase() === current.entityName,
+            );
+
+            if (entity) {
+                result.neighbors.push(entity);
+            }
+        }
+
+        if (current.depth < maxDepth) {
+            const neighbors = adjacencyMap.get(current.entityName) || [];
+
+            for (const neighborKey of neighbors) {
+                if (
+                    !visited.has(neighborKey) &&
+                    result.neighbors.length < maxNodes
+                ) {
+                    visited.add(neighborKey);
+                    queue.push({
+                        entityName: neighborKey,
+                        depth: current.depth + 1,
+                    });
+
+                    // Add relationship
+                    const relKey = `${current.entityName}-${neighborKey}`;
+                    const relationship = relationshipMap.get(relKey);
+                    if (
+                        relationship &&
+                        !result.relationships.find(
+                            (r) => r.rowId === relationship.rowId,
+                        )
+                    ) {
+                        result.relationships.push(relationship);
+                    }
+                }
+            }
+        }
+    }
+
+    // add relationships between neighbors
+    for (let i = 0; i < result.neighbors.length; i++) {
+        for (let j = i + 1; j < result.neighbors.length; j++) {
+            const neighborA = result.neighbors[i];
+            const neighborB = result.neighbors[j];
+            const relKey = `${neighborA.name?.toLowerCase() || neighborA.id?.toLowerCase()}-${neighborB.name?.toLowerCase() || neighborB.id?.toLowerCase()}`;
+            const relationship = relationshipMap.get(relKey);
+            if (
+                relationship &&
+                !result.relationships.find(
+                    (r) => r.rowId === relationship.rowId,
+                )
+            ) {
+                result.relationships.push(relationship);
+            }
+        }
+    }
+
+    return {
+        centerEntity,
+        neighbors: result.neighbors,
+        relationships: result.relationships,
+    };
+}
+
+function calculateEntityMetrics(
+    entities: any[],
+    relationships: any[],
+    communities: any[],
+): any[] {
+    const entityMap = new Map<string, any>();
+    const degreeMap = new Map<string, number>();
+    const communityMap = new Map<string, string>();
+
+    entities.forEach((entity) => {
+        entityMap.set(entity.entityName, {
+            id: entity.entityName,
+            name: entity.entityName,
+            type: entity.entityType || "entity",
+            confidence: entity.confidence || 0.5,
+            count: entity.count || 1,
+        });
+        degreeMap.set(entity.entityName, 0);
+    });
+
+    communities.forEach((community, index) => {
+        let communityEntities: string[] = [];
+        try {
+            communityEntities =
+                typeof community.entities === "string"
+                    ? JSON.parse(community.entities)
+                    : Array.isArray(community.entities)
+                      ? community.entities
+                      : [];
+        } catch (e) {
+            communityEntities = [];
+        }
+
+        communityEntities.forEach((entityName) => {
+            communityMap.set(entityName, community.id || `community_${index}`);
+        });
+    });
+
+    relationships.forEach((rel) => {
+        const from = rel.fromEntity;
+        const to = rel.toEntity;
+
+        if (degreeMap.has(from)) {
+            degreeMap.set(from, degreeMap.get(from)! + 1);
+        }
+        if (degreeMap.has(to)) {
+            degreeMap.set(to, degreeMap.get(to)! + 1);
+        }
+    });
+
+    const maxDegree = Math.max(...Array.from(degreeMap.values())) || 1;
+
+    return Array.from(entityMap.values()).map((entity) => ({
+        ...entity,
+        degree: degreeMap.get(entity.name) || 0,
+        importance: (degreeMap.get(entity.name) || 0) / maxDegree,
+        communityId: communityMap.get(entity.name) || "default",
+        size: Math.max(
+            8,
+            Math.min(40, 8 + Math.sqrt((degreeMap.get(entity.name) || 0) * 3)),
+        ),
+    }));
 }
